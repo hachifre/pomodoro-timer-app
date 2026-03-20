@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ポモドーロ">
+<meta name="theme-color" content="#0b0b1a">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' rx='40' fill='%230b0b1a'/%3E%3Ccircle cx='90' cy='90' r='60' fill='none' stroke='%23f5a623' stroke-width='12'/%3E%3Ctext x='90' y='100' text-anchor='middle' fill='%23f5a623' font-size='36' font-family='monospace'%3E25%3C/text%3E%3C/svg%3E">
+<title>ポモドーロタイマー</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;background:#0b0b1a;color:#ededfc;font-family:'Helvetica Neue',Arial,'Hiragino Kaku Gothic ProN','Yu Gothic',sans-serif;overflow-x:hidden}
+#root{min-height:100vh}
+@keyframes popIn{from{opacity:0;transform:scale(.88) translateY(8px)}to{opacity:1;transform:scale(1) translateY(0)}}
+@keyframes floatY{0%,100%{transform:translateY(0)}50%{transform:translateY(-12px)}}
+@keyframes glPulse{0%,100%{opacity:.9}50%{opacity:1}}
+@keyframes blinkAnim{0%,100%{opacity:1}50%{opacity:.45}}
+button{font-family:inherit;cursor:pointer;border:none;outline:none}
+input{font-family:inherit;outline:none}
+input[type=number]::-webkit-inner-spin-button{opacity:1}
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-thumb{background:#2a2a52;border-radius:2px}
+a{text-decoration:none}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+// ── PWA: Service Worker (Blob登録) ──────────────────────────────
+const swCode=`self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(clients.claim()));self.addEventListener('fetch',e=>e.respondWith(fetch(e.request).catch(()=>new Response(''))));`;
+if('serviceWorker' in navigator){
+  const blob=new Blob([swCode],{type:'application/javascript'});
+  navigator.serviceWorker.register(URL.createObjectURL(blob)).catch(()=>{});
+}
+
+// ── Manifest ────────────────────────────────────────────────────
+const mLink=document.createElement('link');
+mLink.rel='manifest';
+mLink.href='data:application/manifest+json,'+encodeURIComponent(JSON.stringify({
+  name:'ポモドーロタイマー',short_name:'ポモドーロ',start_url:location.href,
+  display:'standalone',background_color:'#0b0b1a',theme_color:'#0b0b1a',
+  icons:[{src:"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='100' fill='%230b0b1a'/%3E%3Ccircle cx='256' cy='256' r='180' fill='none' stroke='%23f5a623' stroke-width='36'/%3E%3C/svg%3E",sizes:'512x512',type:'image/svg+xml'}]
+}));
+document.head.appendChild(mLink);
+
+window.startSilentLoop=function(){};
+window.stopSilentLoop=function(){};
+</script>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+const C={
+  bg:"#0b0b1a",su:"#12122a",up:"#1c1c3a",bd:"#2a2a52",
+  tx:"#ededfc",mu:"#5a5a9a",ml:"#9494c8",
+  wo:"#f5a623",wg:"rgba(245,166,35,0.12)",wd:"#241900",
+  br:"#00ccaa",bg2:"rgba(0,204,170,0.12)",bd2:"#00271f",
+};
+const PRESETS={short:{work:25,break:5},long:{work:50,break:10}};
+const FREE_SITES=[
+  {name:"Pixabay Music",url:"https://pixabay.com/music/",desc:"BGM・環境音が豊富・完全無料"},
+  {name:"Freesound",url:"https://freesound.org/",desc:"効果音・自然音の宝庫"},
+  {name:"Zapsplat",url:"https://www.zapsplat.com/",desc:"BGM・効果音（無料登録）"},
+  {name:"Free Music Archive",url:"https://freemusicarchive.org/",desc:"アーティスト楽曲多数"},
+  {name:"VSQ plus+ 天気の音",url:"https://vsq.co.jp/plus/sound/category_sub/weather/",desc:"天気・環境音21種・日本語サイト"},
+];
+
+const fmt=s=>`${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+const FF="'Helvetica Neue',Arial,'Hiragino Kaku Gothic ProN','Yu Gothic',sans-serif";
+const isIOS=/iP(hone|ad|od)/.test(navigator.userAgent);
+const isPWA=window.navigator.standalone===true;
+
+function Btn({onClick,children,col=C.wo,out=false,sx={}}){
+  const [h,setH]=useState(false);
+  return(
+    <button onClick={onClick} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)}
+      style={{padding:"12px 20px",borderRadius:12,fontSize:14,fontWeight:700,
+        transition:"all .18s",border:out?`1px solid ${col}`:"none",
+        background:out?(h?`${col}22`:"transparent"):h?`${col}cc`:col,
+        color:out?col:"#000",minHeight:48,...sx}}>
+      {children}
+    </button>
+  );
+}
+
+function Ring({progress,phase,tLeft}){
+  const sz=220,sw=10,r=(sz-sw)/2;
+  const ci=2*Math.PI*r,off=ci*(1-Math.max(0,Math.min(1,progress)));
+  const ac=phase==="work"?C.wo:C.br,dm=phase==="work"?C.wd:C.bd2;
+  return(
+    <div style={{position:"relative",width:sz,height:sz}}>
+      <svg width={sz} height={sz} style={{transform:"rotate(-90deg)",position:"absolute",top:0,left:0}}>
+        <circle cx={sz/2} cy={sz/2} r={r} fill="none" stroke={dm} strokeWidth={sw}/>
+        <circle cx={sz/2} cy={sz/2} r={r} fill="none" stroke={ac} strokeWidth={sw}
+          strokeDasharray={ci} strokeDashoffset={off} strokeLinecap="round"
+          style={{transition:"stroke-dashoffset 0.95s linear"}}/>
+      </svg>
+      <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
+        <span style={{fontFamily:"'Courier New',monospace",fontSize:46,fontWeight:700,color:C.tx,letterSpacing:2}}>
+          {fmt(tLeft)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function AudioBlock({label,ac,audio,onSet,ff,inpSx}){
+  const [pick,setPick]=useState(false);
+  const [edit,setEdit]=useState(false);
+  const [nv,setNv]=useState("");
+  const fr=useRef(null);
+  const onFile=e=>{
+    const f=e.target.files[0];if(!f)return;
+    const url=URL.createObjectURL(f);
+    const reader=new FileReader();
+    reader.onload=ev=>{
+      onSet({name:f.name.replace(/\.[^/.]+$/,""),url,arrayBuffer:ev.target.result});
+    };
+    reader.readAsArrayBuffer(f);
+    e.target.value="";
+  };
+  return(
+    <div>
+      <div style={{fontSize:11,color:C.mu,letterSpacing:1.5,marginBottom:8,textTransform:"uppercase"}}>{label}</div>
+      {audio?(
+        <div style={{background:C.up,borderRadius:10,padding:"10px 14px",display:"flex",alignItems:"center",gap:8}}>
+          {edit?(
+            <input value={nv} onChange={e=>setNv(e.target.value)} autoFocus
+              onBlur={()=>{if(nv.trim())onSet({...audio,name:nv.trim()});setEdit(false);}}
+              onKeyDown={e=>e.key==="Enter"&&e.target.blur()}
+              style={{...inpSx,flex:1}}/>
+          ):(
+            <span style={{flex:1,color:ac,fontWeight:600,fontSize:13}}>♪ {audio.name}</span>
+          )}
+          <button onClick={()=>{setEdit(true);setNv(audio.name);}}
+            style={{background:"none",border:"none",color:C.mu,cursor:"pointer",fontSize:18,padding:"2px 6px",minWidth:36,minHeight:36}}>✏</button>
+          <button onClick={()=>onSet(null)}
+            style={{background:"none",border:"none",color:C.mu,cursor:"pointer",fontSize:18,padding:"2px 6px",minWidth:36,minHeight:36}}>✕</button>
+        </div>
+      ):(
+        <div style={{display:"flex",flexDirection:"column",gap:6}}>
+          <Btn onClick={()=>fr.current?.click()} col={ac} out sx={{width:"100%",fontSize:13,padding:"11px 12px"}}>
+            ↑ 音源をアップロード
+          </Btn>
+          {ff.length>0&&(
+            <Btn onClick={()=>setPick(!pick)} col={C.ml} out sx={{width:"100%",fontSize:13,padding:"11px 12px"}}>
+              {pick?"▲ 閉じる":"▼ フォルダから選択"}
+            </Btn>
+          )}
+          <input ref={fr} type="file" accept=".mp3,.wav,.ogg,.aac,.flac,.m4a,.mp4,audio/*" style={{display:"none"}} onChange={onFile}/>
+        </div>
+      )}
+      {pick&&ff.length>0&&(
+        <div style={{marginTop:6,background:C.up,borderRadius:10,maxHeight:150,overflowY:"auto",padding:4}}>
+          {ff.map((f,i)=>(
+            <button key={i} onClick={()=>{onSet(f);setPick(false);}}
+              style={{display:"block",width:"100%",textAlign:"left",padding:"10px 14px",border:"none",background:"transparent",color:C.tx,cursor:"pointer",fontSize:13,borderRadius:8,minHeight:44}}>
+              ♪ {f.name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function App(){
+  const [sc,setSc]=useState("setup");
+  const [tab,setTab]=useState("settings");
+  const [preset,setPreset]=useState("short");
+  const [useCustom,setUseCustom]=useState(false);
+  const [cW,setCW]=useState(25);
+  const [cB,setCB]=useState(5);
+  const [totalSets,setTotalSets]=useState(4);
+  const [run,setRun]=useState(false);
+  const [phase,setPhase]=useState("work");
+  const [curSet,setCurSet]=useState(1);
+  const [tLeft,setTLeft]=useState(0);
+  const [totTime,setTotTime]=useState(0);
+  const [wa,setWa]=useState(null);
+  const [ba,setBa]=useState(null);
+  const [ff,setFf]=useState([]);
+
+  const phR=useRef("work"),csR=useRef(1),tsR=useRef(4);
+  const wmR=useRef(25),bmR=useRef(5),ttR=useRef(0);
+  const iR=useRef(null);
+  const endAtR=useRef(null),runR=useRef(false);
+
+  // ── Audio ──
+  const actxR=useRef(null);
+  const wS=useRef(null),bS=useRef(null);
+  const wBuf=useRef(null),bBuf=useRef(null);
+  const silSrcR=useRef(null);
+
+  const wm=useCustom?cW:PRESETS[preset].work;
+  const bm=useCustom?cB:PRESETS[preset].break;
+
+  useEffect(()=>{phR.current=phase;},[phase]);
+  useEffect(()=>{csR.current=curSet;},[curSet]);
+  useEffect(()=>{tsR.current=totalSets;},[totalSets]);
+  useEffect(()=>{wmR.current=wm;},[wm]);
+  useEffect(()=>{bmR.current=bm;},[bm]);
+  useEffect(()=>{ttR.current=totTime;},[totTime]);
+  useEffect(()=>{runR.current=run;},[run]);
+
+  // 音源変更時はバッファとノードをリセット
+  useEffect(()=>{
+    wBuf.current=null;
+    if(wS.current){try{wS.current.srcNode.stop();}catch(e){} wS.current=null;}
+  },[wa]);
+  useEffect(()=>{
+    bBuf.current=null;
+    if(bS.current){try{bS.current.srcNode.stop();}catch(e){} bS.current=null;}
+  },[ba]);
+
+  const getCur=p=>p==="work"?wS.current:bS.current;
+  const setCur=(p,v)=>{if(p==="work")wS.current=v;else bS.current=v;};
+
+  const calcVol=(t,tot)=>{
+    if(!tot)return 1;
+    const elapsed=tot-t;
+    if(elapsed<5)return elapsed/5;
+    if(t<5)return t/5;
+    return 1;
+  };
+
+  // ── [修正②] iOSアンロック: resume()を明示的に呼ぶ ──
+  const unlockAudio=()=>{
+    if(!actxR.current)
+      actxR.current=new(window.AudioContext||window.webkitAudioContext)();
+    // iOSはAudioContextが suspended で生成されるため明示的にresumeする
+    if(actxR.current.state==='suspended') actxR.current.resume();
+    // 1サンプルの無音を同期的に再生してiOSのオーディオセッションを確立
+    const buf=actxR.current.createBuffer(1,1,actxR.current.sampleRate);
+    const src=actxR.current.createBufferSource();
+    src.buffer=buf; src.connect(actxR.current.destination); src.start(0);
+    // サイレントループ（バックグラウンド維持用）
+    if(!silSrcR.current){
+      const silBuf=actxR.current.createBuffer(1,actxR.current.sampleRate*3,actxR.current.sampleRate);
+      const loop=()=>{
+        const s=actxR.current.createBufferSource();
+        s.buffer=silBuf; s.connect(actxR.current.destination);
+        s.onended=loop; s.start(); silSrcR.current=s;
+      };
+      loop();
+    }
+  };
+
+  // ── [修正②] デコード: iOSの古いSafari対応のためコールバック形式を使用 ──
+  const decodeBuf=(ab)=>new Promise((resolve,reject)=>{
+    actxR.current.decodeAudioData(ab.slice(0),resolve,reject);
+  });
+
+  // ── フェーズ切替時のみノード停止 ──
+  const hardStopP=p=>{
+    const cur=getCur(p); if(!cur)return;
+    try{cur.srcNode.stop();}catch(e){}
+    setCur(p,null);
+  };
+  const hardStopAll=()=>{hardStopP("work");hardStopP("break");};
+
+  // ── [修正①] 再生開始: ループを先行スケジューリング方式に変更（MP3の途切れを解消） ──
+  //
+  // 旧方式: srcNode.loop=true → MP3のエンコーダパディングで折り返し時に無音が発生
+  // 新方式: 次のバッファを200ms前にスケジュールすることで完全シームレスループを実現
+  //
+  const playP=(p,vol=0)=>{
+    const buf=p==="work"?wBuf.current:bBuf.current;
+    hardStopP(p);
+    if(!buf||!actxR.current)return;
+    const actx=actxR.current;
+
+    const gainNode=actx.createGain();
+    gainNode.gain.value=Math.max(0,Math.min(1,vol));
+    gainNode.connect(actx.destination);
+
+    let stopped=false;
+    let timerIds=[];
+    const srcs=[];
+
+    const scheduleNext=(when)=>{
+      if(stopped)return;
+      const src=actx.createBufferSource();
+      src.buffer=buf;
+      src.connect(gainNode);
+      src.start(when);
+      srcs.push(src);
+      // 古いノードを整理（メモリ節約）
+      if(srcs.length>3) srcs.shift();
+
+      // 次のバッファを200ms前にスケジュール（シームレスループの核心）
+      const nextWhen=when+buf.duration;
+      const delay=Math.max(100,(nextWhen-0.2-actx.currentTime)*1000);
+      const tid=setTimeout(()=>{
+        timerIds=timerIds.filter(t=>t!==tid);
+        scheduleNext(nextWhen);
+      },delay);
+      timerIds.push(tid);
+    };
+
+    scheduleNext(actx.currentTime);
+
+    setCur(p,{
+      srcNode:{
+        stop:()=>{
+          stopped=true;
+          timerIds.forEach(clearTimeout);
+          srcs.forEach(s=>{try{s.stop(0);}catch(e){}});
+          timerIds.length=0;
+          srcs.length=0;
+        }
+      },
+      gainNode
+    });
+  };
+
+  // ── gain更新（ノード維持） ──
+  const setVol=(p,v)=>{
+    const cur=getCur(p); if(!cur)return;
+    cur.gainNode.gain.value=Math.max(0,Math.min(1,v));
+  };
+
+  const advancePhase=()=>{
+    hardStopAll();
+    if(phR.current==="work"){
+      const nt=bmR.current*60;
+      phR.current="break";setPhase("break");
+      ttR.current=nt;setTLeft(nt);setTotTime(nt);
+      endAtR.current=Date.now()+nt*1000;
+      playP("break");
+    }else{
+      if(csR.current>=tsR.current){
+        setRun(false);runR.current=false;endAtR.current=null;
+        if(silSrcR.current){try{silSrcR.current.onended=null;silSrcR.current.stop();}catch(e){} silSrcR.current=null;}
+        if(actxR.current){actxR.current.close();actxR.current=null;}
+        setSc("complete");return;
+      }
+      const ns=csR.current+1;csR.current=ns;setCurSet(ns);
+      const nt=wmR.current*60;
+      phR.current="work";setPhase("work");
+      ttR.current=nt;setTLeft(nt);setTotTime(nt);
+      endAtR.current=Date.now()+nt*1000;
+      playP("work");
+    }
+  };
+
+  // カウントダウン
+  useEffect(()=>{
+    if(run){
+      iR.current=setInterval(()=>{
+        setTLeft(t=>{
+          const next=Math.max(0,t-1);
+          if(ttR.current>0)setVol(phR.current,calcVol(next,ttR.current));
+          if(next===0)setTimeout(advancePhase,50);
+          return next;
+        });
+      },1000);
+    }else clearInterval(iR.current);
+    return()=>clearInterval(iR.current);
+  },[run]);
+
+  // バックグラウンド時刻補正
+  useEffect(()=>{
+    const onVis=()=>{
+      if(document.hidden||!runR.current||endAtR.current===null)return;
+      const remaining=Math.round((endAtR.current-Date.now())/1000);
+      if(remaining<=0){
+        setTLeft(0);setTimeout(advancePhase,50);
+      }else{
+        setTLeft(remaining);
+        setVol(phR.current,calcVol(remaining,ttR.current));
+      }
+    };
+    document.addEventListener('visibilitychange',onVis);
+    return()=>document.removeEventListener('visibilitychange',onVis);
+  },[]);
+
+  // ── [修正②] doStart: await後にiOSがContextを再suspendする場合に備えてresume ──
+  const doStart=async()=>{
+    // ① 同期でiOSアンロック（awaitより前に呼ぶことが必須）
+    unlockAudio();
+    // ② デコード（非同期・unlockAudio後なので可能）
+    if(wa&&wa.arrayBuffer&&!wBuf.current){
+      try{wBuf.current=await decodeBuf(wa.arrayBuffer);}catch(e){}
+    }
+    if(ba&&ba.arrayBuffer&&!bBuf.current){
+      try{bBuf.current=await decodeBuf(ba.arrayBuffer);}catch(e){}
+    }
+    // ③ await後にiOSがContextを再suspendしていた場合の安全策
+    if(actxR.current&&actxR.current.state==='suspended'){
+      try{await actxR.current.resume();}catch(e){}
+    }
+    // ④ タイマー起動・再生
+    const wt=wm*60;
+    phR.current="work";csR.current=1;
+    setPhase("work");setCurSet(1);setTLeft(wt);setTotTime(wt);
+    ttR.current=wt;endAtR.current=Date.now()+wt*1000;
+    setRun(true);runR.current=true;setSc("timer");
+    playP("work",0);
+  };
+  const doPause=()=>{
+    setRun(false);runR.current=false;endAtR.current=null;
+    if(actxR.current) actxR.current.suspend();
+  };
+  const doResume=()=>{
+    if(actxR.current) actxR.current.resume();
+    endAtR.current=Date.now()+tLeft*1000;
+    setRun(true);runR.current=true;
+  };
+  const doReset=()=>{
+    setRun(false);runR.current=false;endAtR.current=null;
+    hardStopAll();
+    if(silSrcR.current){try{silSrcR.current.onended=null;silSrcR.current.stop();}catch(e){} silSrcR.current=null;}
+    if(actxR.current){actxR.current.close();actxR.current=null;}
+    setSc("setup");setPhase("work");setCurSet(1);setTLeft(0);setTotTime(0);
+  };
+
+  const doFolder=async()=>{
+    if(!("showDirectoryPicker" in window)){
+      alert("フォルダ読み込みはChrome / Edgeのみ対応しています。\n個別アップロードをご利用ください。");return;
+    }
+    try{
+      const dir=await window.showDirectoryPicker({mode:"read"});
+      const files=[];
+      for await(const entry of dir.values()){
+        if(entry.kind==="file"&&/\.(mp3|wav|ogg|aac|flac|m4a)$/i.test(entry.name)){
+          const f=await entry.getFile();
+          const url=URL.createObjectURL(f);
+          const ab=await f.arrayBuffer();
+          files.push({name:f.name.replace(/\.[^/.]+$/,""),url,arrayBuffer:ab});
+        }
+      }
+      if(files.length===0)alert("対応する音楽ファイルが見つかりませんでした。");
+      else setFf(files);
+    }catch(_){}
+  };
+
+  const prog=totTime>0?(totTime-tLeft)/totTime:0;
+  const ac=phase==="work"?C.wo:C.br;
+  const acG=phase==="work"?C.wg:C.bg2;
+  const inpSx={background:C.up,border:`1px solid ${C.bd}`,borderRadius:8,color:C.tx,padding:"10px 12px",fontSize:15,width:"100%",minHeight:44};
+  const wrap={minHeight:"100vh",background:C.bg,color:C.tx,fontFamily:FF};
+  const inner={maxWidth:480,margin:"0 auto",padding:"24px 16px",display:"flex",flexDirection:"column",alignItems:"center"};
+  const card={background:C.su,border:`1px solid ${C.bd}`,borderRadius:18,padding:"20px 18px",width:"100%"};
+
+  // 完了画面
+  if(sc==="complete")return(
+    <div style={wrap}>
+      <div style={{...inner,justifyContent:"center",minHeight:"100vh"}}>
+        <div style={{textAlign:"center",animation:"popIn .65s cubic-bezier(.34,1.56,.64,1)"}}>
+          <div style={{fontSize:80,lineHeight:1,marginBottom:20,display:"inline-block",animation:"floatY 2.4s ease-in-out infinite"}}>🎉</div>
+          <div style={{fontSize:28,fontWeight:800,color:C.wo,marginBottom:10,animation:"glPulse 2.5s ease-in-out infinite"}}>お疲れ様でした！</div>
+          <div style={{color:C.ml,fontSize:15,marginBottom:6}}>{totalSets}セット × 作業{wm}分、すべて完了</div>
+          <div style={{color:C.mu,fontSize:13,marginBottom:36}}>よく頑張りました。しっかり休んでください ☕</div>
+          <Btn onClick={doReset} sx={{padding:"14px 40px",fontSize:16,borderRadius:14}}>最初に戻る</Btn>
+        </div>
+      </div>
+    </div>
+  );
+
+  // タイマー画面
+  if(sc==="timer")return(
+    <div style={wrap}>
+      <div style={{...inner,gap:0}}>
+        {isIOS&&!isPWA&&(
+          <div style={{width:"100%",background:"#1c1c3a",border:`1px solid ${C.wo}44`,borderRadius:10,padding:"10px 14px",marginBottom:16,fontSize:12,color:C.ml,lineHeight:1.7}}>
+            <b style={{color:C.wo}}>📱 バックグラウンド再生のヒント</b><br/>
+            Safari の「共有」→「ホーム画面に追加」でアプリ化すると安定します。
+          </div>
+        )}
+        <div style={{width:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+          <div style={{fontSize:11,letterSpacing:4,color:C.mu,fontWeight:700}}>FOCUS TIMER</div>
+          <div style={{fontSize:13,color:C.ml}}>
+            <span style={{color:C.tx,fontWeight:800,fontSize:20}}>{curSet}</span>
+            <span> / {totalSets} セット</span>
+          </div>
+        </div>
+        <div style={{marginBottom:18,padding:"6px 20px",borderRadius:24,
+          border:`1px solid ${ac}55`,background:acG,color:ac,
+          fontSize:12,fontWeight:700,letterSpacing:2.5,
+          animation:!run?"blinkAnim 1.4s ease-in-out infinite":undefined}}>
+          {phase==="work"?"● 作業中":"◎ 休憩中"}{!run&&" — 一時停止"}
+        </div>
+        <Ring progress={prog} phase={phase} tLeft={tLeft}/>
+        <div style={{display:"flex",gap:7,marginTop:18,marginBottom:22}}>
+          {Array.from({length:totalSets},(_,i)=>(
+            <div key={i} style={{height:6,borderRadius:3,transition:"all .4s ease",
+              width:i===curSet-1?24:8,
+              background:i<curSet-1?C.wo:i===curSet-1?ac:C.bd}}/>
+          ))}
+        </div>
+        <div style={{display:"flex",gap:10,width:"100%",maxWidth:360}}>
+          {run
+            ?<Btn onClick={doPause} col={ac} sx={{flex:1,padding:"14px",fontSize:15}}>⏸ 一時停止</Btn>
+            :<Btn onClick={doResume} col={ac} sx={{flex:1,padding:"14px",fontSize:15}}>▶ 再開</Btn>
+          }
+          <Btn onClick={doReset} col={C.ml} out sx={{padding:"14px 18px",fontSize:14}}>↩ リセット</Btn>
+        </div>
+        <div style={{marginTop:14,fontSize:12,color:C.mu}}>
+          {phase==="work"?`次：休憩 ${bm}分`:curSet>=totalSets?"次：全セット完了 🎉":`次：作業 ${wm}分（第${curSet+1}セット）`}
+        </div>
+      </div>
+    </div>
+  );
+
+  // セットアップ画面
+  const totalMin=wm*totalSets+bm*Math.max(0,totalSets-1);
+  const hh=Math.floor(totalMin/60),mm=totalMin%60;
+
+  return(
+    <div style={wrap}>
+      <div style={inner}>
+        <div style={{textAlign:"center",marginBottom:22,animation:"popIn .5s ease"}}>
+          <div style={{fontSize:11,letterSpacing:5,color:C.mu,marginBottom:6,fontWeight:700}}>FOCUS TIMER</div>
+          <div style={{fontSize:24,fontWeight:800}}>ポモドーロタイマー</div>
+        </div>
+
+        {isIOS&&!isPWA&&(
+          <div style={{width:"100%",background:"#1c1c3a",border:`1px solid ${C.wo}55`,borderRadius:12,padding:"12px 16px",marginBottom:14,fontSize:12,color:C.ml,lineHeight:1.85,animation:"popIn .5s ease"}}>
+            <div style={{color:C.wo,fontWeight:700,marginBottom:4}}>📱 iPhoneでバックグラウンド再生する方法</div>
+            <div>① Safari 下部の <b style={{color:C.tx}}>共有ボタン（□↑）</b> をタップ</div>
+            <div>② 「<b style={{color:C.tx}}>ホーム画面に追加</b>」を選択して追加</div>
+            <div>③ ホーム画面のアイコンから起動すると画面ロック中も動作します</div>
+          </div>
+        )}
+
+        <div style={{display:"flex",gap:2,marginBottom:14,background:C.su,padding:3,borderRadius:13,border:`1px solid ${C.bd}`,width:"100%"}}>
+          {[["settings","⚙ タイマー設定"],["audio","♪ 音源設定"]].map(([t,l])=>(
+            <button key={t} onClick={()=>setTab(t)} style={{
+              flex:1,padding:"11px 4px",borderRadius:10,border:"none",cursor:"pointer",
+              fontSize:14,fontFamily:FF,transition:"all .18s",minHeight:46,
+              background:tab===t?C.wo:"transparent",
+              color:tab===t?"#000":C.ml,fontWeight:tab===t?700:400}}>{l}</button>
+          ))}
+        </div>
+
+        <div style={{...card,animation:"popIn .5s ease .08s both"}}>
+          {tab==="settings"?(
+            <div style={{display:"flex",flexDirection:"column",gap:22}}>
+              <div>
+                <div style={{fontSize:11,color:C.mu,letterSpacing:1.5,marginBottom:9,textTransform:"uppercase"}}>タイム設定</div>
+                <div style={{display:"flex",gap:6}}>
+                  {[["short","25/5分"],["long","50/10分"],["custom","カスタム"]].map(([k,l])=>{
+                    const on=k==="custom"?useCustom:(!useCustom&&preset===k);
+                    return(
+                      <button key={k} onClick={()=>k==="custom"?setUseCustom(true):(setPreset(k),setUseCustom(false))}
+                        style={{flex:1,padding:"11px 4px",borderRadius:10,cursor:"pointer",fontFamily:FF,
+                          fontSize:13,fontWeight:on?700:400,transition:"all .18s",minHeight:46,
+                          border:`1px solid ${on?C.wo:C.bd}`,
+                          background:on?C.wg:"transparent",color:on?C.wo:C.ml}}>{l}</button>
+                    );
+                  })}
+                </div>
+                {useCustom&&(
+                  <div style={{display:"flex",gap:10,marginTop:10}}>
+                    {[["作業（分）",cW,setCW,1,120],["休憩（分）",cB,setCB,1,60]].map(([lb,val,set,mn,mx])=>(
+                      <div key={lb} style={{flex:1}}>
+                        <div style={{fontSize:11,color:C.mu,marginBottom:5}}>{lb}</div>
+                        <input type="number" min={mn} max={mx} value={val}
+                          onChange={e=>set(Math.max(mn,parseInt(e.target.value)||mn))}
+                          style={inpSx}/>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div>
+                <div style={{fontSize:11,color:C.mu,letterSpacing:1.5,marginBottom:9,textTransform:"uppercase"}}>セット数</div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+                  {[1,2,3,4,5,6,8].map(n=>{
+                    const on=totalSets===n;
+                    return(
+                      <button key={n} onClick={()=>setTotalSets(n)} style={{
+                        width:44,height:44,borderRadius:10,cursor:"pointer",fontFamily:FF,
+                        fontWeight:on?700:400,fontSize:15,transition:"all .18s",
+                        border:`1px solid ${on?C.wo:C.bd}`,
+                        background:on?C.wg:"transparent",color:on?C.wo:C.ml}}>{n}</button>
+                    );
+                  })}
+                  <input type="number" min={1} max={20} value={totalSets}
+                    onChange={e=>setTotalSets(Math.max(1,parseInt(e.target.value)||1))}
+                    style={{...inpSx,width:64}}/>
+                </div>
+              </div>
+              <div style={{background:C.up,borderRadius:12,padding:"14px 16px",fontSize:14,color:C.ml,lineHeight:2}}>
+                <div>作業 <b style={{color:C.wo}}>{wm}分</b> ＋ 休憩 <b style={{color:C.br}}>{bm}分</b> × <b style={{color:C.tx}}>{totalSets}セット</b></div>
+                <div>合計：<b style={{color:C.tx}}>{hh>0?`${hh}時間`:""}{mm>0?`${mm}分`:hh===0?"0分":""}</b></div>
+              </div>
+            </div>
+          ):(
+            <div style={{display:"flex",flexDirection:"column",gap:20}}>
+              <AudioBlock label="作業中の音源" ac={C.wo} audio={wa} onSet={setWa} ff={ff} inpSx={inpSx}/>
+              <div style={{height:1,background:C.bd}}/>
+              <AudioBlock label="休憩中の音源" ac={C.br} audio={ba} onSet={setBa} ff={ff} inpSx={inpSx}/>
+              <div style={{height:1,background:C.bd}}/>
+              <div>
+                <div style={{fontSize:11,color:C.mu,letterSpacing:1.5,marginBottom:8,textTransform:"uppercase"}}>フォルダから一括読み込み</div>
+                <Btn onClick={doFolder} col={C.ml} out sx={{width:"100%",fontSize:14}}>
+                  📁 フォルダを選択（Chrome / Edge対応）
+                </Btn>
+                {ff.length>0&&(
+                  <div style={{marginTop:8,fontSize:12,color:C.br}}>✓ {ff.length}件の音楽ファイルを読み込みました</div>
+                )}
+                <div style={{marginTop:8,fontSize:11,color:C.mu,lineHeight:1.7}}>
+                  ※ 音源なしでも動作します<br/>
+                  ※ 開始・終了前5秒でフェードイン・フェードアウト
+                </div>
+              </div>
+              <div style={{height:1,background:C.bd}}/>
+              <div>
+                <div style={{fontSize:11,color:C.mu,letterSpacing:1.5,marginBottom:8,textTransform:"uppercase"}}>無料音楽ダウンロードサイト</div>
+                {FREE_SITES.map(s=>(
+                  <a key={s.name} href={s.url} target="_blank" rel="noopener noreferrer"
+                    style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                      padding:"12px 14px",borderRadius:10,color:C.tx,marginBottom:6,background:C.up,minHeight:48}}>
+                    <span style={{fontWeight:600,fontSize:14}}>{s.name}</span>
+                    <span style={{color:C.mu,fontSize:11,textAlign:"right",maxWidth:130}}>{s.desc}</span>
+                  </a>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div style={{width:"100%",marginTop:16}}>
+          <Btn onClick={doStart} sx={{width:"100%",padding:"16px",fontSize:17,borderRadius:14}}>
+            ▶ スタート
+          </Btn>
+        </div>
+
+        <div style={{marginTop:14,fontSize:11,color:C.mu,textAlign:"center",lineHeight:1.8}}>
+          フォルダ読み込みは Chrome / Edge のみ対応<br/>
+          iPhoneはホーム画面に追加するとバックグラウンド再生が安定します
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
