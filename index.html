@@ -209,25 +209,17 @@ function App(){
   useEffect(()=>{ttR.current=totTime;},[totTime]);
   useEffect(()=>{runR.current=run;},[run]);
 
-  // ── [修正②] 音源変更時：バックグラウンドで即デコード ──
-  // iOSでは doStart 内の await 後に AudioContext が再 suspend されるため
-  // ファイルアップロード時点でデコードを完了させ doStart を同期関数にする
-  const decodeAb=(ab)=>new Promise((resolve,reject)=>{
-    // OfflineAudioContext はジェスチャー不要でデコード可能（出力しないため）
-    const ctx=new(window.OfflineAudioContext||window.AudioContext||window.webkitAudioContext)(2,44100,44100);
-    ctx.decodeAudioData(ab.slice(0),buf=>{resolve(buf);try{ctx.close();}catch(e){}},err=>{reject(err);try{ctx.close();}catch(e){}});
-  });
+  // 音源変更時：バッファとノードをリセットのみ
+  // ※デコードは doStart 内でメインAudioContext(resume済み)を使って実施する
+  //   iOS Safari は OfflineAudioContext.decodeAudioData に非対応のため
+  //   useEffect 内での事前デコードは行わない
   useEffect(()=>{
     wBuf.current=null;
     if(wS.current){try{wS.current.srcNode.stop();}catch(e){} wS.current=null;}
-    if(!wa?.arrayBuffer)return;
-    decodeAb(wa.arrayBuffer).then(buf=>{wBuf.current=buf;}).catch(()=>{});
   },[wa]);
   useEffect(()=>{
     bBuf.current=null;
     if(bS.current){try{bS.current.srcNode.stop();}catch(e){} bS.current=null;}
-    if(!ba?.arrayBuffer)return;
-    decodeAb(ba.arrayBuffer).then(buf=>{bBuf.current=buf;}).catch(()=>{});
   },[ba]);
 
   const getCur=p=>p==="work"?wS.current:bS.current;
@@ -417,14 +409,34 @@ function App(){
     return()=>document.removeEventListener('visibilitychange',onVis);
   },[]);
 
-  // ── [修正②] doStart: 完全同期関数に変更 ──
-  // async/await を完全に除去。バッファはuseEffectで事前デコード済みのため不要。
-  // iOS はジェスチャーのコールスタック内でのみ AudioContext の操作が有効なため
-  // await を挟むと以降の audio 操作が無効になる（これが従来の「音が出ない」原因）
-  const doStart=()=>{
-    // ① ジェスチャー内で同期的に AudioContext 確立
+  // ── doStart: iOS対応のasync版 ──
+  //
+  // 【iOS Safariの正しい動作原理】
+  //   ① unlockAudio() でジェスチャー内に同期的に resume() を呼ぶ
+  //      → AudioContext が running 状態になる
+  //   ② この後 await を挟んでも、resume() が同期呼び出し済みなので
+  //      iOS はコンテキストを維持する（suspend に戻らない）
+  //   ③ running 状態の AudioContext で decodeAudioData を呼べる
+  //
+  // 【OfflineAudioContext を使わない理由】
+  //   iOS Safari は OfflineAudioContext.decodeAudioData に対応していないため
+  //   useEffect 内での事前デコードが無音で失敗していた（これが音なしの原因）
+  //
+  const doStart=async()=>{
+    // ① 同期: ジェスチャー内で AudioContext 確立 + resume()
     unlockAudio();
-    // ② タイマー起動・再生（バッファはuseEffectで事前デコード済み）
+    const actx=actxR.current;
+    // ② 非同期: メインAudioContext(resume済み)でデコード → iOS でも動作する
+    const decode=(ab)=>new Promise((res,rej)=>actx.decodeAudioData(ab.slice(0),res,rej));
+    if(wa&&wa.arrayBuffer&&!wBuf.current){
+      try{wBuf.current=await decode(wa.arrayBuffer);}catch(e){}
+    }
+    if(ba&&ba.arrayBuffer&&!bBuf.current){
+      try{bBuf.current=await decode(ba.arrayBuffer);}catch(e){}
+    }
+    // ③ await後に念のため resume（iOS が suspend に戻っていた場合の安全策）
+    if(actx.state==='suspended') actx.resume();
+    // ④ タイマー起動・再生
     const wt=wm*60;
     phR.current="work";csR.current=1;
     setPhase("work");setCurSet(1);setTLeft(wt);setTotTime(wt);
