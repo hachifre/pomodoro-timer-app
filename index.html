@@ -571,9 +571,7 @@ function App(){
                       <div key={lb} style={{flex:1}}>
                         <div style={{fontSize:11,color:C.mu,marginBottom:5}}>{lb}</div>
                         <input type="number" min={mn} max={mx} value={val}
-                          onChange={e=>set(e.target.value===''?'':Math.min(mx,parseInt(e.target.value)||0))}
-                          onBlur={e=>set(Math.max(mn,parseInt(e.target.value)||mn))}
-                          onFocus={e=>e.target.select()}
+                          onChange={e=>set(Math.max(mn,parseInt(e.target.value)||mn))}
                           style={inpSx}/>
                       </div>
                     ))}
@@ -594,9 +592,7 @@ function App(){
                     );
                   })}
                   <input type="number" min={1} max={20} value={totalSets}
-                    onChange={e=>setTotalSets(e.target.value===''?'':Math.min(20,parseInt(e.target.value)||0))}
-                    onBlur={e=>setTotalSets(Math.max(1,parseInt(e.target.value)||1))}
-                    onFocus={e=>e.target.select()}
+                    onChange={e=>setTotalSets(Math.max(1,parseInt(e.target.value)||1))}
                     style={{...inpSx,width:64}}/>
                 </div>
               </div>
