@@ -198,10 +198,15 @@ function App(){
   //   iOS Safariは「ユーザーのタップ以外から呼ばれる audio.play()」をブロックする。
   //   フェーズ切替はタイマー起動のため、都度 new Audio().play() は使えない。
   //
-  // 【解決策: 事前アンロック方式】
-  //   doStart（タップ時）に全フェーズ分のAudio要素（作業×2 + 休憩×2）を生成し、
-  //   play()→pause() でiOSのロックを解除しておく。
-  //   以降はそのAudio要素を使い回すことで、タイマー起動でも再生可能。
+  // 【解決策: 無音アンロック方式】
+  //   doStart（タップ時）の同期コード内で全Audio要素(作業×2・休憩×2)の
+  //   play()を volume=0（無音）で開始 → iOSのロックが解除される。
+  //   await Promise.all で全play()完了を待ってから pause→巻き戻し→volume=1。
+  //   以降はそのAudio要素を使い回すことでタイマー起動でも再生可能。
+  //
+  // 【タイミング競合の回避】
+  //   旧実装: play()→then(pause) の非同期完了前に playP が play() → pause に負ける
+  //   新実装: await で pause 完了後に playP を呼ぶ → 競合なし
 
   const preloadedR=useRef(null);
   const wS=useRef(null),bS=useRef(null);
@@ -229,6 +234,7 @@ function App(){
   const getCur=p=>p==="work"?wS.current:bS.current;
   const setCur=(p,v)=>{if(p==="work")wS.current=v;else bS.current=v;};
 
+  // フェードアウト: フェーズ終了前5秒で 1→0
   const calcVol=(t,tot)=>{
     if(!tot)return 1;
     if(t<5)return t/5;
@@ -244,6 +250,7 @@ function App(){
 
   const XFADE_S=5;
 
+  // playP: 事前アンロック済みAudio要素でクロスフェードループ
   const playP=(p,vol=1)=>{
     const pl=preloadedR.current;
     const elA=p==="work"?pl?.wA:pl?.bA;
@@ -260,6 +267,7 @@ function App(){
     let stopped=false;
     let paused=false;
 
+    // アンロック済みなのでタイマー起動でも再生可能
     active.play().catch(()=>{});
 
     const tid=setInterval(()=>{
@@ -336,22 +344,46 @@ function App(){
     }
   };
 
-  // ── doStart: タップ時に全Audio要素を生成してiOSロックを一括解除 ──
-  const doStart=()=>{
-    // タップの同期コールスタック内で全Audio要素を生成
-    // play()→即pause() でiOSのロックを解除（このタイミングでしかできない）
-    const makeAudio=(url)=>{
+  // ── doStart: 無音アンロック方式 ──
+  //
+  // 手順:
+  //   ① volume=0 で全Audio要素の play() をジェスチャーの同期コード内で開始
+  //      → iOSのロック解除が確定（音は出ない）
+  //   ② await Promise.all で全 play() の完了を待つ
+  //      → pause() するタイミングが確定し playP との競合が起きない
+  //   ③ pause→currentTime=0→volume=1 で再利用可能な状態にする
+  //   ④ playP("work",1) で再生開始
+  //
+  const doStart=async()=>{
+    const makeEl=(url)=>{
       if(!url)return null;
       const el=new Audio(url);
       el.preload='auto';
-      const p=el.play();
-      if(p&&p.then)p.then(()=>{ el.pause(); el.currentTime=0; }).catch(()=>{});
+      el.volume=0; // 無音でアンロック（ユーザーに音は聞こえない）
       return el;
     };
-    preloadedR.current={
-      wA:makeAudio(wa?.url||null), wB:makeAudio(wa?.url||null),
-      bA:makeAudio(ba?.url||null), bB:makeAudio(ba?.url||null),
-    };
+    const wA=makeEl(wa?.url||null);
+    const wB=makeEl(wa?.url||null);
+    const bA=makeEl(ba?.url||null);
+    const bB=makeEl(ba?.url||null);
+
+    // ① 同期コード内で全 play() を開始 ← iOSのロック解除はここで確定
+    const plays=[wA,wB,bA,bB]
+      .filter(el=>el&&el.src)
+      .map(el=>el.play().catch(()=>{}));
+
+    // ② await で全 play() 完了を待つ（音量0なので無音）
+    await Promise.all(plays);
+
+    // ③ pause→巻き戻し→音量を戻す
+    [wA,wB,bA,bB].forEach(el=>{
+      if(!el||!el.src)return;
+      el.pause(); el.currentTime=0; el.volume=1;
+    });
+
+    preloadedR.current={wA,wB,bA,bB};
+
+    // ④ タイマー起動・再生（アンロック済みなので確実に鳴る）
     const wt=wm*60;
     phR.current="work";csR.current=1;
     setPhase("work");setCurSet(1);setTLeft(wt);setTotTime(wt);
