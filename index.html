@@ -493,7 +493,7 @@ function App(){
           border:`1px solid ${ac}55`,background:acG,color:ac,
           fontSize:12,fontWeight:700,letterSpacing:2.5,
           animation:!run?"blinkAnim 1.4s ease-in-out infinite":undefined}}>
-          {phase==="work"?"● 作業中":"◎ 休憩中"}{!run&&" — 一時停止"}
+          {!run?"⏸ 一時停止":phase==="work"?"● 作業中":"◎ 休憩中"}
         </div>
         <Ring progress={prog} phase={phase} tLeft={tLeft}/>
         <div style={{display:"flex",gap:7,marginTop:18,marginBottom:22}}>
