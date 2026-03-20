@@ -226,32 +226,14 @@ function App(){
   const setCur=(p,v)=>{if(p==="work")wS.current=v;else bS.current=v;};
 
   const calcVol=(t,tot)=>{
+    // フェードアウト: フェーズ終了前5秒で 1→0
+    // フェードインは廃止（iOSで最初の5秒が無音になる問題を回避）
     if(!tot)return 1;
-    const elapsed=tot-t;
-    if(elapsed<5)return elapsed/5;
     if(t<5)return t/5;
     return 1;
   };
 
-  // ── [修正②] iOSアンロック（同期・ジェスチャー内で完結） ──
-  const unlockAudio=()=>{
-    if(!actxR.current)
-      actxR.current=new(window.AudioContext||window.webkitAudioContext)();
-    actxR.current.resume();
-    const buf=actxR.current.createBuffer(1,1,actxR.current.sampleRate);
-    const src=actxR.current.createBufferSource();
-    src.buffer=buf; src.connect(actxR.current.destination); src.start(0);
-    if(!silSrcR.current){
-      const silBuf=actxR.current.createBuffer(1,actxR.current.sampleRate*3,actxR.current.sampleRate);
-      const loop=()=>{
-        if(!actxR.current)return;
-        const s=actxR.current.createBufferSource();
-        s.buffer=silBuf; s.connect(actxR.current.destination);
-        s.onended=loop; s.start(); silSrcR.current=s;
-      };
-      loop();
-    }
-  };
+
 
   // ── フェーズ切替時のみノード停止 ──
   const hardStopP=p=>{
@@ -361,7 +343,7 @@ function App(){
       phR.current="break";setPhase("break");
       ttR.current=nt;setTLeft(nt);setTotTime(nt);
       endAtR.current=Date.now()+nt*1000;
-      playP("break");
+      playP("break",1);
     }else{
       if(csR.current>=tsR.current){
         setRun(false);runR.current=false;endAtR.current=null;
@@ -374,7 +356,7 @@ function App(){
       phR.current="work";setPhase("work");
       ttR.current=nt;setTLeft(nt);setTotTime(nt);
       endAtR.current=Date.now()+nt*1000;
-      playP("work");
+      playP("work",1);
     }
   };
 
@@ -409,24 +391,47 @@ function App(){
     return()=>document.removeEventListener('visibilitychange',onVis);
   },[]);
 
-  // ── doStart: iOS対応のasync版 ──
+  // ── doStart: iOS Safari 完全対応版 ──
   //
-  // 【iOS Safariの正しい動作原理】
-  //   ① unlockAudio() でジェスチャー内に同期的に resume() を呼ぶ
-  //      → AudioContext が running 状態になる
-  //   ② この後 await を挟んでも、resume() が同期呼び出し済みなので
-  //      iOS はコンテキストを維持する（suspend に戻らない）
-  //   ③ running 状態の AudioContext で decodeAudioData を呼べる
+  // 【iOSで音が出なかった根本原因】
+  //   resume() を await せずに進んでいたため、src.start() 実行時に
+  //   AudioContext がまだ suspended 状態 → suspended中の src.start() は無音
   //
-  // 【OfflineAudioContext を使わない理由】
-  //   iOS Safari は OfflineAudioContext.decodeAudioData に対応していないため
-  //   useEffect 内での事前デコードが無音で失敗していた（これが音なしの原因）
+  // 【正しい手順】
+  //   ① AudioContext 生成はジェスチャー内（同期）で行う ← iOS の必須要件
+  //   ② await resume() で running 状態になるまで確実に待つ
+  //   ③ running 状態の AudioContext で decodeAudioData を実行
+  //   ④ vol=1 で即座に再生開始（フェードインは廃止・フェードアウトのみ残す）
   //
   const doStart=async()=>{
-    // ① 同期: ジェスチャー内で AudioContext 確立 + resume()
-    unlockAudio();
+    // ① AudioContext 生成（ジェスチャーの同期コードで実行）
+    if(!actxR.current)
+      actxR.current=new(window.AudioContext||window.webkitAudioContext)();
     const actx=actxR.current;
-    // ② 非同期: メインAudioContext(resume済み)でデコード → iOS でも動作する
+
+    // ② resume を await → running になるまで待つ（ここが重要）
+    //    iOS Safariはジェスチャー内でresumeを開始していれば
+    //    awaitをはさんでもコンテキストを維持する
+    try{await actx.resume();}catch(e){}
+
+    // ③ 無音1サンプルを再生してiOSオーディオセッションを確立
+    const silOnce=actx.createBuffer(1,1,actx.sampleRate);
+    const silSrc=actx.createBufferSource();
+    silSrc.buffer=silOnce; silSrc.connect(actx.destination); silSrc.start(actx.currentTime);
+
+    // ④ バックグラウンド維持用サイレントループ
+    if(!silSrcR.current){
+      const silBuf=actx.createBuffer(1,actx.sampleRate*3,actx.sampleRate);
+      const loop=()=>{
+        if(!actxR.current)return;
+        const s=actx.createBufferSource();
+        s.buffer=silBuf; s.connect(actx.destination);
+        s.onended=loop; s.start(); silSrcR.current=s;
+      };
+      loop();
+    }
+
+    // ⑤ デコード（running状態のAudioContextで実行 → iOSでも確実に動作）
     const decode=(ab)=>new Promise((res,rej)=>actx.decodeAudioData(ab.slice(0),res,rej));
     if(wa&&wa.arrayBuffer&&!wBuf.current){
       try{wBuf.current=await decode(wa.arrayBuffer);}catch(e){}
@@ -434,15 +439,14 @@ function App(){
     if(ba&&ba.arrayBuffer&&!bBuf.current){
       try{bBuf.current=await decode(ba.arrayBuffer);}catch(e){}
     }
-    // ③ await後に念のため resume（iOS が suspend に戻っていた場合の安全策）
-    if(actx.state==='suspended') actx.resume();
-    // ④ タイマー起動・再生
+
+    // ⑥ タイマー起動・再生（vol=1で即座に音が出る）
     const wt=wm*60;
     phR.current="work";csR.current=1;
     setPhase("work");setCurSet(1);setTLeft(wt);setTotTime(wt);
     ttR.current=wt;endAtR.current=Date.now()+wt*1000;
     setRun(true);runR.current=true;setSc("timer");
-    playP("work",0);
+    playP("work",1);
   };
   const doPause=()=>{
     setRun(false);runR.current=false;endAtR.current=null;
