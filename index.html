@@ -192,11 +192,22 @@ function App(){
   const iR=useRef(null);
   const endAtR=useRef(null),runR=useRef(false);
 
-  // ── Audio ──
-  const actxR=useRef(null);
+  // ── Audio: <audio>要素ベース実装 ──
+  //
+  // 【設計方針】
+  //   Web Audio API (AudioContext + decodeAudioData + BufferSource) は
+  //   iOS Safari との組み合わせで async/await の影響を受け信頼性が低い。
+  //   HTML <audio> 要素の play() はiOSで最も確実に動作するAPIのため全面採用。
+  //
+  // 【クロスフェード方式】
+  //   2つの<audio>要素(elA/elB)を交互に使用。
+  //   残り XFADE_S 秒になったらスタンバイ側をstart→双方のvolumeをランプ。
+  //   setInterval 50ms で音量を更新 → シームレスなループを実現。
+  //
+  // 【一時停止/再開】
+  //   active.pause() / active.play() でそのまま対応。
+
   const wS=useRef(null),bS=useRef(null);
-  const wBuf=useRef(null),bBuf=useRef(null);
-  const silSrcR=useRef(null);
 
   const wm=useCustom?cW:PRESETS[preset].work;
   const bm=useCustom?cB:PRESETS[preset].break;
@@ -209,131 +220,109 @@ function App(){
   useEffect(()=>{ttR.current=totTime;},[totTime]);
   useEffect(()=>{runR.current=run;},[run]);
 
-  // 音源変更時：バッファとノードをリセットのみ
-  // ※デコードは doStart 内でメインAudioContext(resume済み)を使って実施する
-  //   iOS Safari は OfflineAudioContext.decodeAudioData に非対応のため
-  //   useEffect 内での事前デコードは行わない
+  // 音源変更時：再生中であれば停止してリセット
   useEffect(()=>{
-    wBuf.current=null;
-    if(wS.current){try{wS.current.srcNode.stop();}catch(e){} wS.current=null;}
+    if(wS.current){try{wS.current.stop();}catch(e){} wS.current=null;}
   },[wa]);
   useEffect(()=>{
-    bBuf.current=null;
-    if(bS.current){try{bS.current.srcNode.stop();}catch(e){} bS.current=null;}
+    if(bS.current){try{bS.current.stop();}catch(e){} bS.current=null;}
   },[ba]);
 
   const getCur=p=>p==="work"?wS.current:bS.current;
   const setCur=(p,v)=>{if(p==="work")wS.current=v;else bS.current=v;};
 
+  // フェードアウト: フェーズ終了前5秒で 1→0
   const calcVol=(t,tot)=>{
-    // フェードアウト: フェーズ終了前5秒で 1→0
-    // フェードインは廃止（iOSで最初の5秒が無音になる問題を回避）
     if(!tot)return 1;
     if(t<5)return t/5;
     return 1;
   };
 
-
-
-  // ── フェーズ切替時のみノード停止 ──
   const hardStopP=p=>{
     const cur=getCur(p); if(!cur)return;
-    try{cur.srcNode.stop();}catch(e){}
+    try{cur.stop();}catch(e){}
     setCur(p,null);
   };
   const hardStopAll=()=>{hardStopP("work");hardStopP("break");};
 
-  // ── 再生開始: クロスフェード + 先行予約方式 ──
-  //
-  // 【ループ途切れの根本原因】
-  //   MP3はエンコード時に先頭・末尾へ無音パディングが挿入される。
-  //   そのためバッファを単純に繋いでも無音の隙間が生まれる。
-  //
-  // 【解決策: クロスフェード 5秒】
-  //   ① 次のバッファを xfade 秒だけ前倒しで開始する（オーバーラップ）
-  //   ② 終わり側: 再生終了に向けて xfade 秒かけてゲインを 1→0 にランプ
-  //   ③ 始まり側: 再生開始から xfade 秒かけてゲインを 0→1 にランプ
-  //   → 終端と先端が5秒重なり合い、無音区間・パディングを完全に消す
-  //
-  // 【iOSのsetTimeout遅延対策】
-  //   常に LOOKAHEAD 秒先まで予約済みにする（SCHED_MS 毎にチェック）
-  //   LOOKAHEAD は xfade*2+余裕 以上にする必要がある
-  //
-  const XFADE_SEC=5.0;  // クロスフェード幅(秒) ─ 音源の終端・先端を5秒ずつ重ねる
-  const LOOKAHEAD=14.0; // 先行予約する秒数（xfade*2+余裕=14）
-  const SCHED_MS=250;   // 定期チェック間隔(ms)
+  const XFADE_S=5; // クロスフェード秒数（ループ折り返し時の重ね幅）
 
-  const playP=(p,vol=0)=>{
-    const buf=p==="work"?wBuf.current:bBuf.current;
+  // ── 再生開始 ──
+  // <audio>要素2本でクロスフェードループ。
+  // play()はジェスチャーの同期コールスタック内で呼ぶため doStart は同期関数。
+  const playP=(p,vol=1)=>{
+    const audioState=p==="work"?wa:ba;
     hardStopP(p);
-    if(!buf||!actxR.current)return;
-    const actx=actxR.current;
+    if(!audioState?.url)return;
 
-    // 音源が短すぎる場合は xfade を音源長の1/3に制限（クラッシュ防止）
-    const xfade=Math.min(XFADE_SEC, buf.duration/3);
+    const url=audioState.url;
+    const elA=new Audio(url); elA.preload='auto';
+    const elB=new Audio(url); elB.preload='auto';
 
-    // masterGain: フェーズ切替・フェードイン/アウト用の外側ゲイン
-    const masterGain=actx.createGain();
-    masterGain.gain.value=Math.max(0,Math.min(1,vol));
-    masterGain.connect(actx.destination);
-
+    let active=elA, standby=elB;
+    let masterVol=Math.max(0,Math.min(1,vol));
+    let crossfading=false;
     let stopped=false;
-    let nextTime=actx.currentTime;
-    const srcs=[];
-    const fades=[];
-    let tid=null;
+    let paused=false;
 
-    const scheduleAhead=()=>{
-      if(stopped)return;
-      while(nextTime < actx.currentTime + LOOKAHEAD){
-        const src=actx.createBufferSource();
-        src.buffer=buf;
+    active.volume=masterVol;
+    standby.volume=0;
+    // ジェスチャーの同期コールスタック内でplay() → iOS解除
+    active.play().catch(()=>{});
 
-        // バッファごとに個別フェードゲインノードを作成
-        const fadeGain=actx.createGain();
-        src.connect(fadeGain);
-        fadeGain.connect(masterGain);
+    const tid=setInterval(()=>{
+      if(stopped||paused)return;
+      const dur=active.duration;
+      if(!dur||isNaN(dur))return;
+      const remaining=dur-active.currentTime;
 
-        // ── フェードスケジュール ──
-        // 始まり: 0 → 1（xfade秒で立ち上げ）
-        fadeGain.gain.setValueAtTime(0, nextTime);
-        fadeGain.gain.linearRampToValueAtTime(1, nextTime + xfade);
-        // 中間: ずっと 1
-        fadeGain.gain.setValueAtTime(1, nextTime + buf.duration - xfade);
-        // 終わり: 1 → 0（xfade秒で立ち下げ）
-        fadeGain.gain.linearRampToValueAtTime(0, nextTime + buf.duration);
-
-        src.start(nextTime);
-        srcs.push(src);
-        fades.push(fadeGain);
-
-        // 次のバッファは xfade 秒だけ前倒し（クロスフェードのオーバーラップ）
-        nextTime += buf.duration - xfade;
-
-        if(srcs.length>30){srcs.splice(0,srcs.length-30);fades.splice(0,fades.length-30);}
+      // 残り XFADE_S 秒でクロスフェード開始
+      if(remaining<=XFADE_S&&!crossfading){
+        crossfading=true;
+        standby.currentTime=0;
+        standby.play().catch(()=>{});
       }
-      tid=setTimeout(scheduleAhead,SCHED_MS);
-    };
-
-    scheduleAhead();
+      if(crossfading){
+        const t=Math.max(0,Math.min(1,remaining/XFADE_S)); // 1→0
+        active.volume=t*masterVol;
+        standby.volume=(1-t)*masterVol;
+        // クロスフェード完了 → active/standby 交代
+        if(remaining<=0.1){
+          try{active.pause();active.currentTime=0;}catch(e){}
+          const tmp=active; active=standby; standby=tmp;
+          active.volume=masterVol; standby.volume=0;
+          crossfading=false;
+        }
+      }
+    },50);
 
     setCur(p,{
-      srcNode:{
-        stop:()=>{
-          stopped=true;
-          if(tid!==null){clearTimeout(tid);tid=null;}
-          srcs.forEach(s=>{try{s.stop(0);}catch(e){}});
-          srcs.length=0; fades.length=0;
-        }
+      stop:()=>{
+        stopped=true; clearInterval(tid);
+        try{elA.pause();}catch(e){}
+        try{elB.pause();}catch(e){}
       },
-      gainNode:masterGain
+      pause:()=>{
+        paused=true;
+        try{active.pause();}catch(e){}
+        if(crossfading)try{standby.pause();}catch(e){}
+      },
+      resume:()=>{
+        paused=false;
+        active.play().catch(()=>{});
+        if(crossfading)standby.play().catch(()=>{});
+      },
+      setVol:(v)=>{
+        masterVol=Math.max(0,Math.min(1,v));
+        if(!crossfading)active.volume=masterVol;
+        // crossfading中はsetIntervalが masterVol を参照して自動更新
+      }
     });
   };
 
-  // ── gain更新（ノード維持） ──
   const setVol=(p,v)=>{
     const cur=getCur(p); if(!cur)return;
-    cur.gainNode.gain.value=Math.max(0,Math.min(1,v));
+    cur.setVol(v);
   };
 
   const advancePhase=()=>{
@@ -347,8 +336,6 @@ function App(){
     }else{
       if(csR.current>=tsR.current){
         setRun(false);runR.current=false;endAtR.current=null;
-        if(silSrcR.current){try{silSrcR.current.onended=null;silSrcR.current.stop();}catch(e){} silSrcR.current=null;}
-        if(actxR.current){actxR.current.close();actxR.current=null;}
         setSc("complete");return;
       }
       const ns=csR.current+1;csR.current=ns;setCurSet(ns);
@@ -391,56 +378,10 @@ function App(){
     return()=>document.removeEventListener('visibilitychange',onVis);
   },[]);
 
-  // ── doStart: iOS Safari 完全対応版 ──
-  //
-  // 【iOS Safariの正しいアンロック手順】
-  //   iOSは「ユーザーのタップと同期した src.start() 呼び出し」を要求する。
-  //   await の後では「同期」ではなくなるため、start() が無視される。
-  //
-  //   正しい順序：
-  //   ① 同期: AudioContext生成 → 無音バッファを start()  ← ここでiOS解除
-  //   ② 非同期: await resume() → await decode() → playP()
-  //
-  //   ①の start() がタップの同期コールスタック内にある限り、
-  //   その後の await をはさんでもiOSはセッションを維持する。
-  //
-  const doStart=async()=>{
-    // ① 【同期】AudioContext生成 + 無音start() → iOSオーディオセッション確立
-    if(!actxR.current)
-      actxR.current=new(window.AudioContext||window.webkitAudioContext)();
-    const actx=actxR.current;
-
-    // 無音1サンプルを同期的にstart() ← これがiOS解除の核心
-    const silOnce=actx.createBuffer(1,1,actx.sampleRate);
-    const silSrc=actx.createBufferSource();
-    silSrc.buffer=silOnce; silSrc.connect(actx.destination); silSrc.start(0);
-
-    // ② 【非同期】resume()をawait → runningになるまで待つ
-    //    ①のstart()が済んでいるのでiOSはセッションを維持する
-    try{await actx.resume();}catch(e){}
-
-    // ③ バックグラウンド維持用サイレントループ（resume後に開始）
-    if(!silSrcR.current){
-      const silBuf=actx.createBuffer(1,actx.sampleRate*3,actx.sampleRate);
-      const loop=()=>{
-        if(!actxR.current)return;
-        const s=actx.createBufferSource();
-        s.buffer=silBuf; s.connect(actx.destination);
-        s.onended=loop; s.start(); silSrcR.current=s;
-      };
-      loop();
-    }
-
-    // ④ デコード（running状態のAudioContextで実行 → iOSでも確実に動作）
-    const decode=(ab)=>new Promise((res,rej)=>actx.decodeAudioData(ab.slice(0),res,rej));
-    if(wa&&wa.arrayBuffer&&!wBuf.current){
-      try{wBuf.current=await decode(wa.arrayBuffer);}catch(e){}
-    }
-    if(ba&&ba.arrayBuffer&&!bBuf.current){
-      try{bBuf.current=await decode(ba.arrayBuffer);}catch(e){}
-    }
-
-    // ⑤ タイマー起動・再生（vol=1で即座に音が出る）
+  // ── doStart: 完全同期・<audio>要素版 ──
+  // async/await 不使用 → iOSのジェスチャー制限を完全回避
+  // playP() 内の audio.play() がジェスチャーの同期スタック内で呼ばれる
+  const doStart=()=>{
     const wt=wm*60;
     phR.current="work";csR.current=1;
     setPhase("work");setCurSet(1);setTLeft(wt);setTotTime(wt);
@@ -450,18 +391,16 @@ function App(){
   };
   const doPause=()=>{
     setRun(false);runR.current=false;endAtR.current=null;
-    if(actxR.current) actxR.current.suspend();
+    const cur=getCur(phR.current); if(cur)cur.pause();
   };
   const doResume=()=>{
-    if(actxR.current) actxR.current.resume();
     endAtR.current=Date.now()+tLeft*1000;
     setRun(true);runR.current=true;
+    const cur=getCur(phR.current); if(cur)cur.resume();
   };
   const doReset=()=>{
     setRun(false);runR.current=false;endAtR.current=null;
     hardStopAll();
-    if(silSrcR.current){try{silSrcR.current.onended=null;silSrcR.current.stop();}catch(e){} silSrcR.current=null;}
-    if(actxR.current){actxR.current.close();actxR.current=null;}
     setSc("setup");setPhase("work");setCurSet(1);setTLeft(0);setTotTime(0);
   };
 
