@@ -196,17 +196,17 @@ function App(){
   //
   // 【iOSの制約】
   //   iOS Safariは「ユーザーのタップ以外から呼ばれる audio.play()」をブロックする。
-  //   フェーズ切替はタイマー起動のため、都度 new Audio().play() は使えない。
   //
-  // 【解決策: 無音アンロック方式】
-  //   doStart（タップ時）の同期コード内で全Audio要素(作業×2・休憩×2)の
-  //   play()を volume=0（無音）で開始 → iOSのロックが解除される。
-  //   await Promise.all で全play()完了を待ってから pause→巻き戻し→volume=1。
-  //   以降はそのAudio要素を使い回すことでタイマー起動でも再生可能。
+  // 【解決策: 同期アンロック + 100ms遅延再生】
+  //   ① doStart（同期関数）のタップコンテキスト内で全要素の play(volume=0) を呼ぶ
+  //      → iOSのロックが解除される（音量0なので無音）
+  //   ② .then() で pause+reset するが、playP呼び出しより先に完了させる必要がある
+  //      → playP を setTimeout(100ms) で遅らせることで .then() の完了を保証
+  //   ③ 一度アンロックされた要素はタイマー起動の play() でも再生できる
   //
-  // 【タイミング競合の回避】
-  //   旧実装: play()→then(pause) の非同期完了前に playP が play() → pause に負ける
-  //   新実装: await で pause 完了後に playP を呼ぶ → 競合なし
+  // 【doStartを同期関数にする理由】
+  //   async/awaitを使うとReactのsetRun等の状態更新がawait後になり
+  //   iOSのジェスチャーコンテキスト外でのstate更新が不安定になる
 
   const preloadedR=useRef(null);
   const wS=useRef(null),bS=useRef(null);
@@ -250,7 +250,7 @@ function App(){
 
   const XFADE_S=5;
 
-  // playP: 事前アンロック済みAudio要素でクロスフェードループ
+  // playP: アンロック済み要素でクロスフェードループ再生
   const playP=(p,vol=1)=>{
     const pl=preloadedR.current;
     const elA=p==="work"?pl?.wA:pl?.bA;
@@ -267,7 +267,7 @@ function App(){
     let stopped=false;
     let paused=false;
 
-    // アンロック済みなのでタイマー起動でも再生可能
+    // アンロック済みなのでタイマー起動・フェーズ切替からでも再生可能
     active.play().catch(()=>{});
 
     const tid=setInterval(()=>{
@@ -344,52 +344,43 @@ function App(){
     }
   };
 
-  // ── doStart: 無音アンロック方式 ──
+  // ── doStart: 完全同期関数 ──
   //
-  // 手順:
-  //   ① volume=0 で全Audio要素の play() をジェスチャーの同期コード内で開始
-  //      → iOSのロック解除が確定（音は出ない）
-  //   ② await Promise.all で全 play() の完了を待つ
-  //      → pause() するタイミングが確定し playP との競合が起きない
-  //   ③ pause→currentTime=0→volume=1 で再利用可能な状態にする
-  //   ④ playP("work",1) で再生開始
+  // async/await を一切使わない。
+  // ① タップコンテキスト内で全要素を volume=0 で play() → iOSアンロック確定
+  // ② .then() で pause+reset → 約数ms後に完了（音は聞こえない）
+  // ③ React状態更新（setRun等）を同期で実行 → タイマー・UI確実に動く
+  // ④ setTimeout(playP, 100ms) → .then()完了後に再生開始（競合ゼロ）
   //
-  const doStart=async()=>{
+  const doStart=()=>{
+    // 全Audio要素を volume=0（無音）で生成しアンロック
     const makeEl=(url)=>{
       if(!url)return null;
       const el=new Audio(url);
       el.preload='auto';
-      el.volume=0; // 無音でアンロック（ユーザーに音は聞こえない）
+      el.volume=0;
+      // タップコンテキスト内で play() → iOSロック解除
+      // .then() で即 pause+reset → 100ms後の playP より必ず先に完了する
+      el.play()
+        .then(()=>{ el.pause(); el.currentTime=0; el.volume=1; })
+        .catch(()=>{ el.volume=1; }); // play失敗時も volume を戻す
       return el;
     };
-    const wA=makeEl(wa?.url||null);
-    const wB=makeEl(wa?.url||null);
-    const bA=makeEl(ba?.url||null);
-    const bB=makeEl(ba?.url||null);
+    preloadedR.current={
+      wA:makeEl(wa?.url||null), wB:makeEl(wa?.url||null),
+      bA:makeEl(ba?.url||null), bB:makeEl(ba?.url||null),
+    };
 
-    // ① 同期コード内で全 play() を開始 ← iOSのロック解除はここで確定
-    const plays=[wA,wB,bA,bB]
-      .filter(el=>el&&el.src)
-      .map(el=>el.play().catch(()=>{}));
-
-    // ② await で全 play() 完了を待つ（音量0なので無音）
-    await Promise.all(plays);
-
-    // ③ pause→巻き戻し→音量を戻す
-    [wA,wB,bA,bB].forEach(el=>{
-      if(!el||!el.src)return;
-      el.pause(); el.currentTime=0; el.volume=1;
-    });
-
-    preloadedR.current={wA,wB,bA,bB};
-
-    // ④ タイマー起動・再生（アンロック済みなので確実に鳴る）
+    // React状態を同期で更新（タイマー・UI確実に動く）
     const wt=wm*60;
     phR.current="work";csR.current=1;
     setPhase("work");setCurSet(1);setTLeft(wt);setTotTime(wt);
     ttR.current=wt;endAtR.current=Date.now()+wt*1000;
     setRun(true);runR.current=true;setSc("timer");
-    playP("work",1);
+
+    // 100ms後に再生: .then(pause) より後なので競合しない
+    // アンロック済み要素は gesture外の play() でも動作する
+    setTimeout(()=>playP("work",1),100);
   };
   const doPause=()=>{
     setRun(false);runR.current=false;endAtR.current=null;
@@ -407,7 +398,38 @@ function App(){
     setSc("setup");setPhase("work");setCurSet(1);setTLeft(0);setTotTime(0);
   };
 
-  const doFolder=async()=>{
+  // ── カウントダウン ──
+  useEffect(()=>{
+    if(run){
+      iR.current=setInterval(()=>{
+        setTLeft(t=>{
+          const next=Math.max(0,t-1);
+          if(ttR.current>0)setVol(phR.current,calcVol(next,ttR.current));
+          if(next===0)setTimeout(advancePhase,50);
+          return next;
+        });
+      },1000);
+    }else clearInterval(iR.current);
+    return()=>clearInterval(iR.current);
+  },[run]);
+
+  // ── バックグラウンド時刻補正 ──
+  useEffect(()=>{
+    const onVis=()=>{
+      if(document.hidden||!runR.current||endAtR.current===null)return;
+      const remaining=Math.round((endAtR.current-Date.now())/1000);
+      if(remaining<=0){
+        setTLeft(0);setTimeout(advancePhase,50);
+      }else{
+        setTLeft(remaining);
+        setVol(phR.current,calcVol(remaining,ttR.current));
+      }
+    };
+    document.addEventListener('visibilitychange',onVis);
+    return()=>document.removeEventListener('visibilitychange',onVis);
+  },[]);
+
+    const doFolder=async()=>{
     if(!("showDirectoryPicker" in window)){
       alert("フォルダ読み込みはChrome / Edgeのみ対応しています。\n個別アップロードをご利用ください。");return;
     }
