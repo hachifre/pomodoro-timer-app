@@ -393,33 +393,33 @@ function App(){
 
   // ── doStart: iOS Safari 完全対応版 ──
   //
-  // 【iOSで音が出なかった根本原因】
-  //   resume() を await せずに進んでいたため、src.start() 実行時に
-  //   AudioContext がまだ suspended 状態 → suspended中の src.start() は無音
+  // 【iOS Safariの正しいアンロック手順】
+  //   iOSは「ユーザーのタップと同期した src.start() 呼び出し」を要求する。
+  //   await の後では「同期」ではなくなるため、start() が無視される。
   //
-  // 【正しい手順】
-  //   ① AudioContext 生成はジェスチャー内（同期）で行う ← iOS の必須要件
-  //   ② await resume() で running 状態になるまで確実に待つ
-  //   ③ running 状態の AudioContext で decodeAudioData を実行
-  //   ④ vol=1 で即座に再生開始（フェードインは廃止・フェードアウトのみ残す）
+  //   正しい順序：
+  //   ① 同期: AudioContext生成 → 無音バッファを start()  ← ここでiOS解除
+  //   ② 非同期: await resume() → await decode() → playP()
+  //
+  //   ①の start() がタップの同期コールスタック内にある限り、
+  //   その後の await をはさんでもiOSはセッションを維持する。
   //
   const doStart=async()=>{
-    // ① AudioContext 生成（ジェスチャーの同期コードで実行）
+    // ① 【同期】AudioContext生成 + 無音start() → iOSオーディオセッション確立
     if(!actxR.current)
       actxR.current=new(window.AudioContext||window.webkitAudioContext)();
     const actx=actxR.current;
 
-    // ② resume を await → running になるまで待つ（ここが重要）
-    //    iOS Safariはジェスチャー内でresumeを開始していれば
-    //    awaitをはさんでもコンテキストを維持する
-    try{await actx.resume();}catch(e){}
-
-    // ③ 無音1サンプルを再生してiOSオーディオセッションを確立
+    // 無音1サンプルを同期的にstart() ← これがiOS解除の核心
     const silOnce=actx.createBuffer(1,1,actx.sampleRate);
     const silSrc=actx.createBufferSource();
-    silSrc.buffer=silOnce; silSrc.connect(actx.destination); silSrc.start(actx.currentTime);
+    silSrc.buffer=silOnce; silSrc.connect(actx.destination); silSrc.start(0);
 
-    // ④ バックグラウンド維持用サイレントループ
+    // ② 【非同期】resume()をawait → runningになるまで待つ
+    //    ①のstart()が済んでいるのでiOSはセッションを維持する
+    try{await actx.resume();}catch(e){}
+
+    // ③ バックグラウンド維持用サイレントループ（resume後に開始）
     if(!silSrcR.current){
       const silBuf=actx.createBuffer(1,actx.sampleRate*3,actx.sampleRate);
       const loop=()=>{
@@ -431,7 +431,7 @@ function App(){
       loop();
     }
 
-    // ⑤ デコード（running状態のAudioContextで実行 → iOSでも確実に動作）
+    // ④ デコード（running状態のAudioContextで実行 → iOSでも確実に動作）
     const decode=(ab)=>new Promise((res,rej)=>actx.decodeAudioData(ab.slice(0),res,rej));
     if(wa&&wa.arrayBuffer&&!wBuf.current){
       try{wBuf.current=await decode(wa.arrayBuffer);}catch(e){}
@@ -440,7 +440,7 @@ function App(){
       try{bBuf.current=await decode(ba.arrayBuffer);}catch(e){}
     }
 
-    // ⑥ タイマー起動・再生（vol=1で即座に音が出る）
+    // ⑤ タイマー起動・再生（vol=1で即座に音が出る）
     const wt=wm*60;
     phR.current="work";csR.current=1;
     setPhase("work");setCurSet(1);setTLeft(wt);setTotTime(wt);
