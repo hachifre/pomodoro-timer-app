@@ -209,14 +209,25 @@ function App(){
   useEffect(()=>{ttR.current=totTime;},[totTime]);
   useEffect(()=>{runR.current=run;},[run]);
 
-  // 音源変更時はバッファとノードをリセット
+  // ── [修正②] 音源変更時：バックグラウンドで即デコード ──
+  // iOSでは doStart 内の await 後に AudioContext が再 suspend されるため
+  // ファイルアップロード時点でデコードを完了させ doStart を同期関数にする
+  const decodeAb=(ab)=>new Promise((resolve,reject)=>{
+    // OfflineAudioContext はジェスチャー不要でデコード可能（出力しないため）
+    const ctx=new(window.OfflineAudioContext||window.AudioContext||window.webkitAudioContext)(2,44100,44100);
+    ctx.decodeAudioData(ab.slice(0),buf=>{resolve(buf);try{ctx.close();}catch(e){}},err=>{reject(err);try{ctx.close();}catch(e){}});
+  });
   useEffect(()=>{
     wBuf.current=null;
     if(wS.current){try{wS.current.srcNode.stop();}catch(e){} wS.current=null;}
+    if(!wa?.arrayBuffer)return;
+    decodeAb(wa.arrayBuffer).then(buf=>{wBuf.current=buf;}).catch(()=>{});
   },[wa]);
   useEffect(()=>{
     bBuf.current=null;
     if(bS.current){try{bS.current.srcNode.stop();}catch(e){} bS.current=null;}
+    if(!ba?.arrayBuffer)return;
+    decodeAb(ba.arrayBuffer).then(buf=>{bBuf.current=buf;}).catch(()=>{});
   },[ba]);
 
   const getCur=p=>p==="work"?wS.current:bS.current;
@@ -230,20 +241,18 @@ function App(){
     return 1;
   };
 
-  // ── [修正②] iOSアンロック: resume()を明示的に呼ぶ ──
+  // ── [修正②] iOSアンロック（同期・ジェスチャー内で完結） ──
   const unlockAudio=()=>{
     if(!actxR.current)
       actxR.current=new(window.AudioContext||window.webkitAudioContext)();
-    // iOSはAudioContextが suspended で生成されるため明示的にresumeする
-    if(actxR.current.state==='suspended') actxR.current.resume();
-    // 1サンプルの無音を同期的に再生してiOSのオーディオセッションを確立
+    actxR.current.resume();
     const buf=actxR.current.createBuffer(1,1,actxR.current.sampleRate);
     const src=actxR.current.createBufferSource();
     src.buffer=buf; src.connect(actxR.current.destination); src.start(0);
-    // サイレントループ（バックグラウンド維持用）
     if(!silSrcR.current){
       const silBuf=actxR.current.createBuffer(1,actxR.current.sampleRate*3,actxR.current.sampleRate);
       const loop=()=>{
+        if(!actxR.current)return;
         const s=actxR.current.createBufferSource();
         s.buffer=silBuf; s.connect(actxR.current.destination);
         s.onended=loop; s.start(); silSrcR.current=s;
@@ -251,11 +260,6 @@ function App(){
       loop();
     }
   };
-
-  // ── [修正②] デコード: iOSの古いSafari対応のためコールバック形式を使用 ──
-  const decodeBuf=(ab)=>new Promise((resolve,reject)=>{
-    actxR.current.decodeAudioData(ab.slice(0),resolve,reject);
-  });
 
   // ── フェーズ切替時のみノード停止 ──
   const hardStopP=p=>{
@@ -265,58 +269,90 @@ function App(){
   };
   const hardStopAll=()=>{hardStopP("work");hardStopP("break");};
 
-  // ── [修正①] 再生開始: ループを先行スケジューリング方式に変更（MP3の途切れを解消） ──
+  // ── 再生開始: クロスフェード + 先行予約方式 ──
   //
-  // 旧方式: srcNode.loop=true → MP3のエンコーダパディングで折り返し時に無音が発生
-  // 新方式: 次のバッファを200ms前にスケジュールすることで完全シームレスループを実現
+  // 【ループ途切れの根本原因】
+  //   MP3はエンコード時に先頭・末尾へ無音パディングが挿入される。
+  //   そのためバッファを単純に繋いでも無音の隙間が生まれる。
   //
+  // 【解決策: クロスフェード 5秒】
+  //   ① 次のバッファを xfade 秒だけ前倒しで開始する（オーバーラップ）
+  //   ② 終わり側: 再生終了に向けて xfade 秒かけてゲインを 1→0 にランプ
+  //   ③ 始まり側: 再生開始から xfade 秒かけてゲインを 0→1 にランプ
+  //   → 終端と先端が5秒重なり合い、無音区間・パディングを完全に消す
+  //
+  // 【iOSのsetTimeout遅延対策】
+  //   常に LOOKAHEAD 秒先まで予約済みにする（SCHED_MS 毎にチェック）
+  //   LOOKAHEAD は xfade*2+余裕 以上にする必要がある
+  //
+  const XFADE_SEC=5.0;  // クロスフェード幅(秒) ─ 音源の終端・先端を5秒ずつ重ねる
+  const LOOKAHEAD=14.0; // 先行予約する秒数（xfade*2+余裕=14）
+  const SCHED_MS=250;   // 定期チェック間隔(ms)
+
   const playP=(p,vol=0)=>{
     const buf=p==="work"?wBuf.current:bBuf.current;
     hardStopP(p);
     if(!buf||!actxR.current)return;
     const actx=actxR.current;
 
-    const gainNode=actx.createGain();
-    gainNode.gain.value=Math.max(0,Math.min(1,vol));
-    gainNode.connect(actx.destination);
+    // 音源が短すぎる場合は xfade を音源長の1/3に制限（クラッシュ防止）
+    const xfade=Math.min(XFADE_SEC, buf.duration/3);
+
+    // masterGain: フェーズ切替・フェードイン/アウト用の外側ゲイン
+    const masterGain=actx.createGain();
+    masterGain.gain.value=Math.max(0,Math.min(1,vol));
+    masterGain.connect(actx.destination);
 
     let stopped=false;
-    let timerIds=[];
+    let nextTime=actx.currentTime;
     const srcs=[];
+    const fades=[];
+    let tid=null;
 
-    const scheduleNext=(when)=>{
+    const scheduleAhead=()=>{
       if(stopped)return;
-      const src=actx.createBufferSource();
-      src.buffer=buf;
-      src.connect(gainNode);
-      src.start(when);
-      srcs.push(src);
-      // 古いノードを整理（メモリ節約）
-      if(srcs.length>3) srcs.shift();
+      while(nextTime < actx.currentTime + LOOKAHEAD){
+        const src=actx.createBufferSource();
+        src.buffer=buf;
 
-      // 次のバッファを200ms前にスケジュール（シームレスループの核心）
-      const nextWhen=when+buf.duration;
-      const delay=Math.max(100,(nextWhen-0.2-actx.currentTime)*1000);
-      const tid=setTimeout(()=>{
-        timerIds=timerIds.filter(t=>t!==tid);
-        scheduleNext(nextWhen);
-      },delay);
-      timerIds.push(tid);
+        // バッファごとに個別フェードゲインノードを作成
+        const fadeGain=actx.createGain();
+        src.connect(fadeGain);
+        fadeGain.connect(masterGain);
+
+        // ── フェードスケジュール ──
+        // 始まり: 0 → 1（xfade秒で立ち上げ）
+        fadeGain.gain.setValueAtTime(0, nextTime);
+        fadeGain.gain.linearRampToValueAtTime(1, nextTime + xfade);
+        // 中間: ずっと 1
+        fadeGain.gain.setValueAtTime(1, nextTime + buf.duration - xfade);
+        // 終わり: 1 → 0（xfade秒で立ち下げ）
+        fadeGain.gain.linearRampToValueAtTime(0, nextTime + buf.duration);
+
+        src.start(nextTime);
+        srcs.push(src);
+        fades.push(fadeGain);
+
+        // 次のバッファは xfade 秒だけ前倒し（クロスフェードのオーバーラップ）
+        nextTime += buf.duration - xfade;
+
+        if(srcs.length>30){srcs.splice(0,srcs.length-30);fades.splice(0,fades.length-30);}
+      }
+      tid=setTimeout(scheduleAhead,SCHED_MS);
     };
 
-    scheduleNext(actx.currentTime);
+    scheduleAhead();
 
     setCur(p,{
       srcNode:{
         stop:()=>{
           stopped=true;
-          timerIds.forEach(clearTimeout);
+          if(tid!==null){clearTimeout(tid);tid=null;}
           srcs.forEach(s=>{try{s.stop(0);}catch(e){}});
-          timerIds.length=0;
-          srcs.length=0;
+          srcs.length=0; fades.length=0;
         }
       },
-      gainNode
+      gainNode:masterGain
     });
   };
 
@@ -381,22 +417,14 @@ function App(){
     return()=>document.removeEventListener('visibilitychange',onVis);
   },[]);
 
-  // ── [修正②] doStart: await後にiOSがContextを再suspendする場合に備えてresume ──
-  const doStart=async()=>{
-    // ① 同期でiOSアンロック（awaitより前に呼ぶことが必須）
+  // ── [修正②] doStart: 完全同期関数に変更 ──
+  // async/await を完全に除去。バッファはuseEffectで事前デコード済みのため不要。
+  // iOS はジェスチャーのコールスタック内でのみ AudioContext の操作が有効なため
+  // await を挟むと以降の audio 操作が無効になる（これが従来の「音が出ない」原因）
+  const doStart=()=>{
+    // ① ジェスチャー内で同期的に AudioContext 確立
     unlockAudio();
-    // ② デコード（非同期・unlockAudio後なので可能）
-    if(wa&&wa.arrayBuffer&&!wBuf.current){
-      try{wBuf.current=await decodeBuf(wa.arrayBuffer);}catch(e){}
-    }
-    if(ba&&ba.arrayBuffer&&!bBuf.current){
-      try{bBuf.current=await decodeBuf(ba.arrayBuffer);}catch(e){}
-    }
-    // ③ await後にiOSがContextを再suspendしていた場合の安全策
-    if(actxR.current&&actxR.current.state==='suspended'){
-      try{await actxR.current.resume();}catch(e){}
-    }
-    // ④ タイマー起動・再生
+    // ② タイマー起動・再生（バッファはuseEffectで事前デコード済み）
     const wt=wm*60;
     phR.current="work";csR.current=1;
     setPhase("work");setCurSet(1);setTLeft(wt);setTotTime(wt);
