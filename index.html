@@ -194,19 +194,16 @@ function App(){
 
   // ── Audio: <audio>要素ベース実装 ──
   //
-  // 【設計方針】
-  //   Web Audio API (AudioContext + decodeAudioData + BufferSource) は
-  //   iOS Safari との組み合わせで async/await の影響を受け信頼性が低い。
-  //   HTML <audio> 要素の play() はiOSで最も確実に動作するAPIのため全面採用。
+  // 【iOSの制約】
+  //   iOS Safariは「ユーザーのタップ以外から呼ばれる audio.play()」をブロックする。
+  //   フェーズ切替はタイマー起動のため、都度 new Audio().play() は使えない。
   //
-  // 【クロスフェード方式】
-  //   2つの<audio>要素(elA/elB)を交互に使用。
-  //   残り XFADE_S 秒になったらスタンバイ側をstart→双方のvolumeをランプ。
-  //   setInterval 50ms で音量を更新 → シームレスなループを実現。
-  //
-  // 【一時停止/再開】
-  //   active.pause() / active.play() でそのまま対応。
+  // 【解決策: 事前アンロック方式】
+  //   doStart（タップ時）に全フェーズ分のAudio要素（作業×2 + 休憩×2）を生成し、
+  //   play()→pause() でiOSのロックを解除しておく。
+  //   以降はそのAudio要素を使い回すことで、タイマー起動でも再生可能。
 
+  const preloadedR=useRef(null);
   const wS=useRef(null),bS=useRef(null);
 
   const wm=useCustom?cW:PRESETS[preset].work;
@@ -220,18 +217,18 @@ function App(){
   useEffect(()=>{ttR.current=totTime;},[totTime]);
   useEffect(()=>{runR.current=run;},[run]);
 
-  // 音源変更時：再生中であれば停止してリセット
   useEffect(()=>{
+    preloadedR.current=null;
     if(wS.current){try{wS.current.stop();}catch(e){} wS.current=null;}
   },[wa]);
   useEffect(()=>{
+    preloadedR.current=null;
     if(bS.current){try{bS.current.stop();}catch(e){} bS.current=null;}
   },[ba]);
 
   const getCur=p=>p==="work"?wS.current:bS.current;
   const setCur=(p,v)=>{if(p==="work")wS.current=v;else bS.current=v;};
 
-  // フェードアウト: フェーズ終了前5秒で 1→0
   const calcVol=(t,tot)=>{
     if(!tot)return 1;
     if(t<5)return t/5;
@@ -245,19 +242,17 @@ function App(){
   };
   const hardStopAll=()=>{hardStopP("work");hardStopP("break");};
 
-  const XFADE_S=5; // クロスフェード秒数（ループ折り返し時の重ね幅）
+  const XFADE_S=5;
 
-  // ── 再生開始 ──
-  // <audio>要素2本でクロスフェードループ。
-  // play()はジェスチャーの同期コールスタック内で呼ぶため doStart は同期関数。
   const playP=(p,vol=1)=>{
-    const audioState=p==="work"?wa:ba;
+    const pl=preloadedR.current;
+    const elA=p==="work"?pl?.wA:pl?.bA;
+    const elB=p==="work"?pl?.wB:pl?.bB;
     hardStopP(p);
-    if(!audioState?.url)return;
+    if(!elA||!elB)return;
 
-    const url=audioState.url;
-    const elA=new Audio(url); elA.preload='auto';
-    const elB=new Audio(url); elB.preload='auto';
+    elA.currentTime=0; elB.currentTime=0;
+    elA.volume=Math.max(0,Math.min(1,vol)); elB.volume=0;
 
     let active=elA, standby=elB;
     let masterVol=Math.max(0,Math.min(1,vol));
@@ -265,29 +260,24 @@ function App(){
     let stopped=false;
     let paused=false;
 
-    active.volume=masterVol;
-    standby.volume=0;
-    // ジェスチャーの同期コールスタック内でplay() → iOS解除
     active.play().catch(()=>{});
 
     const tid=setInterval(()=>{
       if(stopped||paused)return;
       const dur=active.duration;
       if(!dur||isNaN(dur))return;
-      const remaining=dur-active.currentTime;
+      const remaining=Math.max(0,dur-active.currentTime);
 
-      // 残り XFADE_S 秒でクロスフェード開始
       if(remaining<=XFADE_S&&!crossfading){
         crossfading=true;
         standby.currentTime=0;
         standby.play().catch(()=>{});
       }
       if(crossfading){
-        const t=Math.max(0,Math.min(1,remaining/XFADE_S)); // 1→0
+        const t=Math.max(0,Math.min(1,remaining/XFADE_S));
         active.volume=t*masterVol;
         standby.volume=(1-t)*masterVol;
-        // クロスフェード完了 → active/standby 交代
-        if(remaining<=0.1){
+        if(remaining<=0.05){
           try{active.pause();active.currentTime=0;}catch(e){}
           const tmp=active; active=standby; standby=tmp;
           active.volume=masterVol; standby.volume=0;
@@ -299,8 +289,8 @@ function App(){
     setCur(p,{
       stop:()=>{
         stopped=true; clearInterval(tid);
-        try{elA.pause();}catch(e){}
-        try{elB.pause();}catch(e){}
+        try{elA.pause();elA.currentTime=0;}catch(e){}
+        try{elB.pause();elB.currentTime=0;}catch(e){}
       },
       pause:()=>{
         paused=true;
@@ -315,7 +305,6 @@ function App(){
       setVol:(v)=>{
         masterVol=Math.max(0,Math.min(1,v));
         if(!crossfading)active.volume=masterVol;
-        // crossfading中はsetIntervalが masterVol を参照して自動更新
       }
     });
   };
@@ -347,41 +336,22 @@ function App(){
     }
   };
 
-  // カウントダウン
-  useEffect(()=>{
-    if(run){
-      iR.current=setInterval(()=>{
-        setTLeft(t=>{
-          const next=Math.max(0,t-1);
-          if(ttR.current>0)setVol(phR.current,calcVol(next,ttR.current));
-          if(next===0)setTimeout(advancePhase,50);
-          return next;
-        });
-      },1000);
-    }else clearInterval(iR.current);
-    return()=>clearInterval(iR.current);
-  },[run]);
-
-  // バックグラウンド時刻補正
-  useEffect(()=>{
-    const onVis=()=>{
-      if(document.hidden||!runR.current||endAtR.current===null)return;
-      const remaining=Math.round((endAtR.current-Date.now())/1000);
-      if(remaining<=0){
-        setTLeft(0);setTimeout(advancePhase,50);
-      }else{
-        setTLeft(remaining);
-        setVol(phR.current,calcVol(remaining,ttR.current));
-      }
-    };
-    document.addEventListener('visibilitychange',onVis);
-    return()=>document.removeEventListener('visibilitychange',onVis);
-  },[]);
-
-  // ── doStart: 完全同期・<audio>要素版 ──
-  // async/await 不使用 → iOSのジェスチャー制限を完全回避
-  // playP() 内の audio.play() がジェスチャーの同期スタック内で呼ばれる
+  // ── doStart: タップ時に全Audio要素を生成してiOSロックを一括解除 ──
   const doStart=()=>{
+    // タップの同期コールスタック内で全Audio要素を生成
+    // play()→即pause() でiOSのロックを解除（このタイミングでしかできない）
+    const makeAudio=(url)=>{
+      if(!url)return null;
+      const el=new Audio(url);
+      el.preload='auto';
+      const p=el.play();
+      if(p&&p.then)p.then(()=>{ el.pause(); el.currentTime=0; }).catch(()=>{});
+      return el;
+    };
+    preloadedR.current={
+      wA:makeAudio(wa?.url||null), wB:makeAudio(wa?.url||null),
+      bA:makeAudio(ba?.url||null), bB:makeAudio(ba?.url||null),
+    };
     const wt=wm*60;
     phR.current="work";csR.current=1;
     setPhase("work");setCurSet(1);setTLeft(wt);setTotTime(wt);
@@ -401,6 +371,7 @@ function App(){
   const doReset=()=>{
     setRun(false);runR.current=false;endAtR.current=null;
     hardStopAll();
+    preloadedR.current=null;
     setSc("setup");setPhase("work");setCurSet(1);setTLeft(0);setTotTime(0);
   };
 
