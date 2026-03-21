@@ -258,6 +258,10 @@ function App(){
     hardStopP(p);
     if(!elA||!elB)return;
 
+    // _claimed=true にすることで makeEl の .then(pause) がこの要素を止めなくなる
+    // iOSではバッファリングに数秒かかるため .then() が遅延発火する場合がある
+    elA._claimed=true; elB._claimed=true;
+
     elA.currentTime=0; elB.currentTime=0;
     elA.volume=Math.max(0,Math.min(1,vol)); elB.volume=0;
 
@@ -359,11 +363,16 @@ function App(){
       const el=new Audio(url);
       el.preload='auto';
       el.volume=0;
-      // タップコンテキスト内で play() → iOSロック解除
-      // .then() で即 pause+reset → 100ms後の playP より必ず先に完了する
+      el._claimed=false; // playPが使用開始したら true になる
+      // タップコンテキスト内で play() → iOSロック解除（音量0なので無音）
+      // .then() は iOSのバッファリング完了後に発火するため数秒遅延することがある
+      // _claimed チェックにより playP 使用中の要素は絶対に pause しない
       el.play()
-        .then(()=>{ el.pause(); el.currentTime=0; el.volume=1; })
-        .catch(()=>{ el.volume=1; }); // play失敗時も volume を戻す
+        .then(()=>{
+          if(!el._claimed){ el.pause(); el.currentTime=0; }
+          el.volume=1;
+        })
+        .catch(()=>{ el.volume=1; });
       return el;
     };
     preloadedR.current={
@@ -371,16 +380,16 @@ function App(){
       bA:makeEl(ba?.url||null), bB:makeEl(ba?.url||null),
     };
 
-    // React状態を同期で更新（タイマー・UI確実に動く）
+    // React状態・タイマー・再生をすべて同期で実行
+    // setTimeout を使わないことで表示の二重化を防ぐ
     const wt=wm*60;
     phR.current="work";csR.current=1;
     setPhase("work");setCurSet(1);setTLeft(wt);setTotTime(wt);
     ttR.current=wt;endAtR.current=Date.now()+wt*1000;
     setRun(true);runR.current=true;setSc("timer");
-
-    // 100ms後に再生: .then(pause) より後なので競合しない
-    // アンロック済み要素は gesture外の play() でも動作する
-    setTimeout(()=>playP("work",1),100);
+    // playP は _claimed=true を設定してから play() するため
+    // .then(pause) と競合しない
+    playP("work",1);
   };
   const doPause=()=>{
     setRun(false);runR.current=false;endAtR.current=null;
@@ -571,7 +580,9 @@ function App(){
                       <div key={lb} style={{flex:1}}>
                         <div style={{fontSize:11,color:C.mu,marginBottom:5}}>{lb}</div>
                         <input type="number" min={mn} max={mx} value={val}
-                          onChange={e=>set(Math.max(mn,parseInt(e.target.value)||mn))}
+                          onChange={e=>set(e.target.value===''?'':Math.min(mx,parseInt(e.target.value)||0))}
+                          onBlur={e=>set(Math.max(mn,parseInt(e.target.value)||mn))}
+                          onFocus={e=>e.target.select()}
                           style={inpSx}/>
                       </div>
                     ))}
@@ -592,7 +603,9 @@ function App(){
                     );
                   })}
                   <input type="number" min={1} max={20} value={totalSets}
-                    onChange={e=>setTotalSets(Math.max(1,parseInt(e.target.value)||1))}
+                    onChange={e=>setTotalSets(e.target.value===''?'':Math.min(20,parseInt(e.target.value)||0))}
+                    onBlur={e=>setTotalSets(Math.max(1,parseInt(e.target.value)||1))}
+                    onFocus={e=>e.target.select()}
                     style={{...inpSx,width:64}}/>
                 </div>
               </div>
