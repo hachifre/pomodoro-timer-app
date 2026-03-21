@@ -195,22 +195,18 @@ function App(){
 
   // ── Audio: <audio>要素ベース実装 ──
   //
-  // 【iOSの制約】
+  // 【iOSの制約と対策】
   //   iOS Safariは「ユーザーのタップ以外から呼ばれる audio.play()」をブロックする。
+  //   → doStart（同期関数）のタップコンテキスト内で全要素を volume=0 で play() しアンロック。
   //
-  // 【解決策: 同期アンロック + 100ms遅延再生】
-  //   ① doStart（同期関数）のタップコンテキスト内で全要素の play(volume=0) を呼ぶ
-  //      → iOSのロックが解除される（音量0なので無音）
-  //   ② .then() で pause+reset するが、playP呼び出しより先に完了させる必要がある
-  //      → playP を setTimeout(100ms) で遅らせることで .then() の完了を保証
-  //   ③ 一度アンロックされた要素はタイマー起動の play() でも再生できる
-  //
-  // 【doStartを同期関数にする理由】
-  //   async/awaitを使うとReactのsetRun等の状態更新がawait後になり
-  //   iOSのジェスチャーコンテキスト外でのstate更新が不安定になる
+  // 【iOSバックグラウンドの制約と対策】
+  //   ロック画面ではsetIntervalが停止し、playP内のclosure状態が実際の
+  //   Audio要素と乖離する。
+  //   → 全操作(pause/resume/stop)は要素を直接操作する関数を通す。
+  //   → loop=trueで音切れ防止、フェーズ切替はフォアグラウンド復帰時に行う。
 
   const preloadedR=useRef(null);
-  const wS=useRef(null),bS=useRef(null);
+  const xfadeTidR=useRef(null); // crossfade用setIntervalのID
 
   const wm=useCustom?cW:PRESETS[preset].work;
   const bm=useCustom?cB:PRESETS[preset].break;
@@ -223,18 +219,6 @@ function App(){
   useEffect(()=>{ttR.current=totTime;},[totTime]);
   useEffect(()=>{runR.current=run;},[run]);
 
-  useEffect(()=>{
-    preloadedR.current=null;
-    if(wS.current){try{wS.current.stop();}catch(e){} wS.current=null;}
-  },[wa]);
-  useEffect(()=>{
-    preloadedR.current=null;
-    if(bS.current){try{bS.current.stop();}catch(e){} bS.current=null;}
-  },[ba]);
-
-  const getCur=p=>p==="work"?wS.current:bS.current;
-  const setCur=(p,v)=>{if(p==="work")wS.current=v;else bS.current=v;};
-
   // フェードアウト: フェーズ終了前5秒で 1→0
   const calcVol=(t,tot)=>{
     if(!tot)return 1;
@@ -242,45 +226,69 @@ function App(){
     return 1;
   };
 
-  const hardStopP=p=>{
-    const cur=getCur(p); if(!cur)return;
-    try{cur.stop();}catch(e){}
-    setCur(p,null);
-  };
-  const hardStopAll=()=>{hardStopP("work");hardStopP("break");};
-
   const XFADE_S=5;
 
-  // playP: アンロック済み要素でクロスフェードループ再生
-  // playP: アンロック済み要素でクロスフェードループ再生
-  // iOSバックグラウンド対策: loop=trueで音切れ防止
-  // フェーズ切替はフォアグラウンド復帰時にvisibilitychangeで行う
-  const playP=(p,vol=1)=>{
-    const pl=preloadedR.current;
-    const elA=p==="work"?pl?.wA:pl?.bA;
-    const elB=p==="work"?pl?.wB:pl?.bB;
-    hardStopP(p);
-    if(!elA||!elB)return;
+  // ── 全Audio要素を直接操作するユーティリティ ──
+  // iOSではclosure内の状態が信用できないため、要素を直接触る
+
+  // 指定フェーズの要素を取得
+  const getEls=(p)=>{
+    const pl=preloadedR.current; if(!pl)return[];
+    return p==="work"?[pl.wA,pl.wB].filter(Boolean):[pl.bA,pl.bB].filter(Boolean);
+  };
+  const getAllEls=()=>{
+    const pl=preloadedR.current; if(!pl)return[];
+    return[pl.wA,pl.wB,pl.bA,pl.bB].filter(Boolean);
+  };
+
+  // 全要素を一時停止（直接操作、controllerに依存しない）
+  const pauseAllElements=()=>{
+    if(xfadeTidR.current){clearInterval(xfadeTidR.current);xfadeTidR.current=null;}
+    getAllEls().forEach(el=>{try{el.pause();}catch(e){}});
+  };
+
+  // 全要素を完全停止
+  const stopAllElements=()=>{
+    pauseAllElements();
+    getAllEls().forEach(el=>{
+      try{el.currentTime=0;el.loop=false;}catch(e){}
+    });
+  };
+
+  // 全要素を完全破棄（リセット用）
+  const destroyAllElements=()=>{
+    stopAllElements();
+    getAllEls().forEach(el=>{
+      try{el.src='';el.load();}catch(e){}
+    });
+    preloadedR.current=null;
+  };
+
+  // 指定フェーズの音声を再生開始（他フェーズは必ず停止）
+  const startPhaseAudio=(p,vol=1)=>{
+    // まず全停止
+    stopAllElements();
+
+    const els=getEls(p);
+    if(els.length<2)return;
+    const[elA,elB]=els;
 
     elA._claimed=true; elB._claimed=true;
-
-    // iOSバックグラウンドではcrossfade用setIntervalが停止するため
-    // loop=trueにして音声が途切れないようにする（フォアグラウンドではcrossfadeが優先）
     elA.loop=true; elB.loop=true;
-
     elA.currentTime=0; elB.currentTime=0;
     elA.volume=Math.max(0,Math.min(1,vol)); elB.volume=0;
 
+    // active/standbyはcrossfadeのためだけにローカルで管理
     let active=elA, standby=elB;
     let masterVol=Math.max(0,Math.min(1,vol));
     let crossfading=false;
-    let stopped=false;
-    let paused=false;
 
     active.play().catch(()=>{});
 
-    const tid=setInterval(()=>{
-      if(stopped||paused)return;
+    // crossfade用interval（フォアグラウンド時のみ動作）
+    xfadeTidR.current=setInterval(()=>{
+      // 要素がpauseされていたらcrossfadeしない（一時停止中）
+      if(active.paused)return;
       const dur=active.duration;
       if(!dur||isNaN(dur))return;
       const remaining=Math.max(0,dur-active.currentTime);
@@ -288,6 +296,7 @@ function App(){
       if(remaining<=XFADE_S&&!crossfading){
         crossfading=true;
         standby.currentTime=0;
+        standby.volume=0;
         standby.play().catch(()=>{});
       }
       if(crossfading){
@@ -302,51 +311,91 @@ function App(){
         }
       }
     },50);
+  };
 
-    setCur(p,{
-      stop:()=>{
-        stopped=true; clearInterval(tid);
-        try{elA.pause();elA.currentTime=0;elA.loop=false;}catch(e){}
-        try{elB.pause();elB.currentTime=0;elB.loop=false;}catch(e){}
-      },
-      pause:()=>{
-        paused=true;
-        try{active.pause();}catch(e){}
-        if(crossfading)try{standby.pause();}catch(e){}
-      },
-      resume:()=>{
-        paused=false;
-        active.play().catch(()=>{});
-        if(crossfading)standby.play().catch(()=>{});
-      },
-      setVol:(v)=>{
-        masterVol=Math.max(0,Math.min(1,v));
-        if(!crossfading)active.volume=masterVol;
-      }
+  // 現在のフェーズの音量を調整
+  const setPhaseVol=(p,v)=>{
+    const els=getEls(p);
+    const vol=Math.max(0,Math.min(1,v));
+    els.forEach(el=>{
+      // 再生中の要素の音量のみ調整（volume>0 or playing）
+      if(!el.paused)el.volume=vol;
     });
   };
 
-  const setVol=(p,v)=>{
-    const cur=getCur(p); if(!cur)return;
-    cur.setVol(v);
+  // 現在のフェーズの音声を再開
+  const resumePhaseAudio=(p)=>{
+    // まず他フェーズの要素を確実に停止
+    const otherP=p==="work"?"break":"work";
+    getEls(otherP).forEach(el=>{
+      try{el.pause();el.currentTime=0;}catch(e){}
+    });
+
+    const els=getEls(p);
+    if(els.length<2)return;
+    const[elA,elB]=els;
+
+    // elAだけを再開（crossfadeはstartPhaseAudioで開始済みのintervalが処理する）
+    // どちらが最後にactiveだったか不明なので、currentTime>0の方を再開
+    let resumed=false;
+    [elA,elB].forEach(el=>{
+      if(!resumed&&el.currentTime>0&&el.paused){
+        el.play().catch(()=>{});
+        resumed=true;
+      }
+    });
+    // どちらもcurrentTime=0なら elA を再開
+    if(!resumed){
+      elA.play().catch(()=>{});
+    }
+
+    // crossfade intervalを再開
+    if(!xfadeTidR.current){
+      let active=elA.paused?elB:elA, standby=elA.paused?elA:elB;
+      let masterVol=1;
+      let crossfading=false;
+      xfadeTidR.current=setInterval(()=>{
+        if(active.paused&&!crossfading)return;
+        const dur=active.duration;
+        if(!dur||isNaN(dur))return;
+        const remaining=Math.max(0,dur-active.currentTime);
+        if(remaining<=XFADE_S&&!crossfading){
+          crossfading=true;
+          standby.currentTime=0;
+          standby.volume=0;
+          standby.play().catch(()=>{});
+        }
+        if(crossfading){
+          const t=Math.max(0,Math.min(1,remaining/XFADE_S));
+          active.volume=t*masterVol;
+          standby.volume=(1-t)*masterVol;
+          if(remaining<=0.05){
+            try{active.pause();active.currentTime=0;}catch(e){}
+            const tmp=active;active=standby;standby=tmp;
+            active.volume=masterVol;standby.volume=0;
+            crossfading=false;
+          }
+        }
+      },50);
+    }
   };
 
   // advancePhase: skipAudio=trueの場合、音声切替をスキップ（バックグラウンド復帰時の高速巻き送り用）
   const advancePhase=(skipAudio=false)=>{
     if(advancingR.current)return;
     advancingR.current=true;
-    if(!skipAudio)hardStopAll();
+    if(!skipAudio)stopAllElements();
     if(phR.current==="work"){
       const nt=bmR.current*60;
       phR.current="break";setPhase("break");
       ttR.current=nt;setTLeft(nt);setTotTime(nt);
       endAtR.current=Date.now()+nt*1000;
-      if(!skipAudio)playP("break",1);
+      if(!skipAudio)startPhaseAudio("break",1);
     }else{
       if(csR.current>=tsR.current){
         setRun(false);runR.current=false;endAtR.current=null;
         advancingR.current=false;
-        if(!skipAudio)hardStopAll();
+        if(!skipAudio)stopAllElements();
         setSc("complete");return;
       }
       const ns=csR.current+1;csR.current=ns;setCurSet(ns);
@@ -354,23 +403,9 @@ function App(){
       phR.current="work";setPhase("work");
       ttR.current=nt;setTLeft(nt);setTotTime(nt);
       endAtR.current=Date.now()+nt*1000;
-      if(!skipAudio)playP("work",1);
+      if(!skipAudio)startPhaseAudio("work",1);
     }
     advancingR.current=false;
-  };
-
-  // 全プリロード済みAudio要素を強制停止（リセット用）
-  // hardStopAllは制御オブジェクト経由だが、これは要素を直接停止する
-  const forceStopAllAudio=()=>{
-    hardStopAll();
-    const pl=preloadedR.current;
-    if(pl){
-      [pl.wA,pl.wB,pl.bA,pl.bB].forEach(el=>{
-        if(!el)return;
-        try{el.pause();el.currentTime=0;el.loop=false;el.src='';el.load();}catch(e){}
-      });
-    }
-    preloadedR.current=null;
   };
 
   // ── doStart: 完全同期関数 ──
@@ -379,7 +414,6 @@ function App(){
   // ① タップコンテキスト内で全要素を volume=0 で play() → iOSアンロック確定
   // ② .then() で pause+reset → 約数ms後に完了（音は聞こえない）
   // ③ React状態更新（setRun等）を同期で実行 → タイマー・UI確実に動く
-  // ④ setTimeout(playP, 100ms) → .then()完了後に再生開始（競合ゼロ）
   //
   const doStart=()=>{
     // 全Audio要素を volume=0（無音）で生成しアンロック
@@ -388,10 +422,7 @@ function App(){
       const el=new Audio(url);
       el.preload='auto';
       el.volume=0;
-      el._claimed=false; // playPが使用開始したら true になる
-      // タップコンテキスト内で play() → iOSロック解除（音量0なので無音）
-      // .then() は iOSのバッファリング完了後に発火するため数秒遅延することがある
-      // _claimed チェックにより playP 使用中の要素は絶対に pause しない
+      el._claimed=false;
       el.play()
         .then(()=>{
           if(!el._claimed){ el.pause(); el.currentTime=0; }
@@ -405,42 +436,40 @@ function App(){
       bA:makeEl(ba?.url||null), bB:makeEl(ba?.url||null),
     };
 
-    // React状態・タイマー・再生をすべて同期で実行
-    // setTimeout を使わないことで表示の二重化を防ぐ
     const wt=wm*60;
     phR.current="work";csR.current=1;
     setPhase("work");setCurSet(1);setTLeft(wt);setTotTime(wt);
     ttR.current=wt;endAtR.current=Date.now()+wt*1000;
     setRun(true);runR.current=true;setSc("timer");
-    // playP は _claimed=true を設定してから play() するため
-    // .then(pause) と競合しない
-    playP("work",1);
+    startPhaseAudio("work",1);
   };
   const doPause=()=>{
     setRun(false);runR.current=false;endAtR.current=null;
-    const cur=getCur(phR.current); if(cur)cur.pause();
+    // 全要素を直接一時停止（closure状態に依存しない）
+    pauseAllElements();
   };
   const doResume=()=>{
     endAtR.current=Date.now()+tLeft*1000;
     setRun(true);runR.current=true;
-    const cur=getCur(phR.current); if(cur)cur.resume();
+    // 現在フェーズの音声のみ再開（他フェーズは確実に停止）
+    resumePhaseAudio(phR.current);
   };
   const doReset=()=>{
     setRun(false);runR.current=false;endAtR.current=null;
     advancingR.current=false;
-    forceStopAllAudio();
+    // 全要素を完全破棄
+    destroyAllElements();
     setSc("setup");setPhase("work");setCurSet(1);setTLeft(0);setTotTime(0);
   };
 
   // ── カウントダウン（フォアグラウンド用） ──
-  // Date.now()ベースで正確な残時間を計算
   useEffect(()=>{
     if(run){
       iR.current=setInterval(()=>{
         if(!runR.current||endAtR.current===null||advancingR.current)return;
         const remaining=Math.max(0,Math.round((endAtR.current-Date.now())/1000));
         setTLeft(remaining);
-        if(ttR.current>0)setVol(phR.current,calcVol(remaining,ttR.current));
+        if(ttR.current>0)setPhaseVol(phR.current,calcVol(remaining,ttR.current));
         if(remaining<=0)advancePhase();
       },1000);
     }else clearInterval(iR.current);
@@ -448,9 +477,6 @@ function App(){
   },[run]);
 
   // ── バックグラウンド復帰時の一括復元 ──
-  // iOSバックグラウンドではsetIntervalが停止しフェーズ切替が行われないため、
-  // フォアグラウンド復帰時にDate.now()ベースで正しいフェーズまで一気に巻き送りする。
-  // 音声切替はすべての巻き送り完了後に1回だけ行う。
   useEffect(()=>{
     const onVis=()=>{
       if(document.hidden||!runR.current||endAtR.current===null)return;
@@ -459,27 +485,29 @@ function App(){
       if(remaining>0){
         // 現在のフェーズがまだ進行中 → 時間だけ補正
         setTLeft(remaining);
-        setVol(phR.current,calcVol(remaining,ttR.current));
+        setPhaseVol(phR.current,calcVol(remaining,ttR.current));
         return;
       }
 
       // フェーズ終了を超過 → 音声なしで高速巻き送り
-      const prevPhase=phR.current;
       let loopGuard=0;
       while(remaining<=0&&runR.current&&loopGuard<100){
         loopGuard++;
         advancePhase(true); // skipAudio=true
-        if(!runR.current)break; // 全セット完了
+        if(!runR.current)break;
         remaining=Math.round((endAtR.current-Date.now())/1000);
       }
 
-      if(!runR.current)return; // 完了画面へ遷移済み
+      if(!runR.current){
+        // 全セット完了 → 音を全停止
+        stopAllElements();
+        return;
+      }
 
-      // 正しいフェーズの音声を開始
-      hardStopAll();
+      // 正しいフェーズの音声を開始（全要素を一度停止してから）
+      const vol=calcVol(Math.max(0,remaining),ttR.current);
       setTLeft(Math.max(0,remaining));
-      setVol(phR.current,calcVol(remaining,ttR.current));
-      playP(phR.current,calcVol(remaining,ttR.current));
+      startPhaseAudio(phR.current,vol);
     };
     document.addEventListener('visibilitychange',onVis);
     return()=>document.removeEventListener('visibilitychange',onVis);
