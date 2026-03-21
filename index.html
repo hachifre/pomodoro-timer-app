@@ -193,12 +193,6 @@ function App(){
   const endAtR=useRef(null),runR=useRef(false);
   const advancingR=useRef(false);
 
-  // ── バックグラウンド心拍チェック ──
-  // iOSロック画面ではsetIntervalが停止するが、再生中のaudio要素の
-  // timeupdateイベントは発火し続ける。これを「心拍」として利用し、
-  // Date.now()で実時間を確認してフェーズ切替・残時間更新を行う。
-  const bgHeartbeatR=useRef(null);
-
   // ── Audio: <audio>要素ベース実装 ──
   //
   // 【iOSの制約】
@@ -258,7 +252,9 @@ function App(){
   const XFADE_S=5;
 
   // playP: アンロック済み要素でクロスフェードループ再生
-  // iOSバックグラウンド対策: loop=trueで音切れ防止 + timeupdateで心拍駆動
+  // playP: アンロック済み要素でクロスフェードループ再生
+  // iOSバックグラウンド対策: loop=trueで音切れ防止
+  // フェーズ切替はフォアグラウンド復帰時にvisibilitychangeで行う
   const playP=(p,vol=1)=>{
     const pl=preloadedR.current;
     const elA=p==="work"?pl?.wA:pl?.bA;
@@ -266,8 +262,6 @@ function App(){
     hardStopP(p);
     if(!elA||!elB)return;
 
-    // _claimed=true にすることで makeEl の .then(pause) がこの要素を止めなくなる
-    // iOSではバッファリングに数秒かかるため .then() が遅延発火する場合がある
     elA._claimed=true; elB._claimed=true;
 
     // iOSバックグラウンドではcrossfade用setIntervalが停止するため
@@ -283,22 +277,6 @@ function App(){
     let stopped=false;
     let paused=false;
 
-    // ── iOSバックグラウンド心拍 ──
-    // timeupdateはiOSロック画面でもaudio再生中は発火し続けるため、
-    // これをタイマー心拍として使い、Date.now()でフェーズ切替を判定する。
-    // スロットル: 最大1秒に1回
-    let lastHB=0;
-    const onTimeUpdate=()=>{
-      if(stopped||paused)return;
-      const now=Date.now();
-      if(now-lastHB<900)return;
-      lastHB=now;
-      if(bgHeartbeatR.current)bgHeartbeatR.current();
-    };
-    elA.addEventListener('timeupdate',onTimeUpdate);
-    elB.addEventListener('timeupdate',onTimeUpdate);
-
-    // アンロック済みなのでタイマー起動・フェーズ切替からでも再生可能
     active.play().catch(()=>{});
 
     const tid=setInterval(()=>{
@@ -328,8 +306,6 @@ function App(){
     setCur(p,{
       stop:()=>{
         stopped=true; clearInterval(tid);
-        elA.removeEventListener('timeupdate',onTimeUpdate);
-        elB.removeEventListener('timeupdate',onTimeUpdate);
         try{elA.pause();elA.currentTime=0;elA.loop=false;}catch(e){}
         try{elB.pause();elB.currentTime=0;elB.loop=false;}catch(e){}
       },
@@ -355,21 +331,22 @@ function App(){
     cur.setVol(v);
   };
 
-  const advancePhase=()=>{
-    // 二重呼び出し防止（バックグラウンド心拍とsetIntervalの両方から呼ばれる可能性）
+  // advancePhase: skipAudio=trueの場合、音声切替をスキップ（バックグラウンド復帰時の高速巻き送り用）
+  const advancePhase=(skipAudio=false)=>{
     if(advancingR.current)return;
     advancingR.current=true;
-    hardStopAll();
+    if(!skipAudio)hardStopAll();
     if(phR.current==="work"){
       const nt=bmR.current*60;
       phR.current="break";setPhase("break");
       ttR.current=nt;setTLeft(nt);setTotTime(nt);
       endAtR.current=Date.now()+nt*1000;
-      playP("break",1);
+      if(!skipAudio)playP("break",1);
     }else{
       if(csR.current>=tsR.current){
         setRun(false);runR.current=false;endAtR.current=null;
         advancingR.current=false;
+        if(!skipAudio)hardStopAll();
         setSc("complete");return;
       }
       const ns=csR.current+1;csR.current=ns;setCurSet(ns);
@@ -377,22 +354,23 @@ function App(){
       phR.current="work";setPhase("work");
       ttR.current=nt;setTLeft(nt);setTotTime(nt);
       endAtR.current=Date.now()+nt*1000;
-      playP("work",1);
+      if(!skipAudio)playP("work",1);
     }
-    setTimeout(()=>{advancingR.current=false;},200);
+    advancingR.current=false;
   };
 
-  // ── バックグラウンド心拍関数の設定 ──
-  // playP内のaudio timeupdateイベントから呼ばれる
-  bgHeartbeatR.current=()=>{
-    if(!runR.current||endAtR.current===null||advancingR.current)return;
-    const remaining=Math.round((endAtR.current-Date.now())/1000);
-    if(remaining<=0){
-      advancePhase();
-    }else{
-      setTLeft(remaining);
-      if(ttR.current>0)setVol(phR.current,calcVol(remaining,ttR.current));
+  // 全プリロード済みAudio要素を強制停止（リセット用）
+  // hardStopAllは制御オブジェクト経由だが、これは要素を直接停止する
+  const forceStopAllAudio=()=>{
+    hardStopAll();
+    const pl=preloadedR.current;
+    if(pl){
+      [pl.wA,pl.wB,pl.bA,pl.bB].forEach(el=>{
+        if(!el)return;
+        try{el.pause();el.currentTime=0;el.loop=false;el.src='';el.load();}catch(e){}
+      });
     }
+    preloadedR.current=null;
   };
 
   // ── doStart: 完全同期関数 ──
@@ -450,8 +428,7 @@ function App(){
   const doReset=()=>{
     setRun(false);runR.current=false;endAtR.current=null;
     advancingR.current=false;
-    hardStopAll();
-    preloadedR.current=null;
+    forceStopAllAudio();
     setSc("setup");setPhase("work");setCurSet(1);setTLeft(0);setTotTime(0);
   };
 
@@ -470,17 +447,39 @@ function App(){
     return()=>clearInterval(iR.current);
   },[run]);
 
-  // ── バックグラウンド復帰時の補正 ──
+  // ── バックグラウンド復帰時の一括復元 ──
+  // iOSバックグラウンドではsetIntervalが停止しフェーズ切替が行われないため、
+  // フォアグラウンド復帰時にDate.now()ベースで正しいフェーズまで一気に巻き送りする。
+  // 音声切替はすべての巻き送り完了後に1回だけ行う。
   useEffect(()=>{
     const onVis=()=>{
-      if(document.hidden||!runR.current||endAtR.current===null||advancingR.current)return;
-      const remaining=Math.round((endAtR.current-Date.now())/1000);
-      if(remaining<=0){
-        setTLeft(0);advancePhase();
-      }else{
+      if(document.hidden||!runR.current||endAtR.current===null)return;
+      let remaining=Math.round((endAtR.current-Date.now())/1000);
+
+      if(remaining>0){
+        // 現在のフェーズがまだ進行中 → 時間だけ補正
         setTLeft(remaining);
         setVol(phR.current,calcVol(remaining,ttR.current));
+        return;
       }
+
+      // フェーズ終了を超過 → 音声なしで高速巻き送り
+      const prevPhase=phR.current;
+      let loopGuard=0;
+      while(remaining<=0&&runR.current&&loopGuard<100){
+        loopGuard++;
+        advancePhase(true); // skipAudio=true
+        if(!runR.current)break; // 全セット完了
+        remaining=Math.round((endAtR.current-Date.now())/1000);
+      }
+
+      if(!runR.current)return; // 完了画面へ遷移済み
+
+      // 正しいフェーズの音声を開始
+      hardStopAll();
+      setTLeft(Math.max(0,remaining));
+      setVol(phR.current,calcVol(remaining,ttR.current));
+      playP(phR.current,calcVol(remaining,ttR.current));
     };
     document.addEventListener('visibilitychange',onVis);
     return()=>document.removeEventListener('visibilitychange',onVis);
