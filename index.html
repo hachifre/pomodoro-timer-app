@@ -423,12 +423,15 @@ function App(){
       el.preload='auto';
       el.volume=0;
       el._claimed=false;
+      // タップコンテキスト内で play() → iOSロック解除（音量0なので無音）
+      // _claimed=false の要素は volume=0 のまま維持する。
+      // iOSバックグラウンドでは pause() が効かない場合があり、
+      // volume=1 にすると意図しない音源が聞こえてしまうため。
       el.play()
         .then(()=>{
-          if(!el._claimed){ el.pause(); el.currentTime=0; }
-          el.volume=1;
+          if(!el._claimed){ el.pause(); el.currentTime=0; el.volume=0; }
         })
-        .catch(()=>{ el.volume=1; });
+        .catch(()=>{});
       return el;
     };
     preloadedR.current={
@@ -477,15 +480,18 @@ function App(){
   },[run]);
 
   // ── バックグラウンド復帰時の一括復元 ──
+  // iOSバックグラウンドでは意図しない音声要素が再生状態になり得るため、
+  // フォアグラウンド復帰時は常に全停止→正しいフェーズの音声を再開する。
   useEffect(()=>{
     const onVis=()=>{
       if(document.hidden||!runR.current||endAtR.current===null)return;
       let remaining=Math.round((endAtR.current-Date.now())/1000);
 
       if(remaining>0){
-        // 現在のフェーズがまだ進行中 → 時間だけ補正
+        // 現在のフェーズがまだ進行中 → 全停止して正しいフェーズを再開
         setTLeft(remaining);
-        setPhaseVol(phR.current,calcVol(remaining,ttR.current));
+        const vol=calcVol(remaining,ttR.current);
+        startPhaseAudio(phR.current,vol);
         return;
       }
 
@@ -499,12 +505,11 @@ function App(){
       }
 
       if(!runR.current){
-        // 全セット完了 → 音を全停止
         stopAllElements();
         return;
       }
 
-      // 正しいフェーズの音声を開始（全要素を一度停止してから）
+      // 正しいフェーズの音声を開始
       const vol=calcVol(Math.max(0,remaining),ttR.current);
       setTLeft(Math.max(0,remaining));
       startPhaseAudio(phR.current,vol);
