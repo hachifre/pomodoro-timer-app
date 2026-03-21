@@ -191,6 +191,13 @@ function App(){
   const wmR=useRef(25),bmR=useRef(5),ttR=useRef(0);
   const iR=useRef(null);
   const endAtR=useRef(null),runR=useRef(false);
+  const advancingR=useRef(false);
+
+  // ── バックグラウンド心拍チェック ──
+  // iOSロック画面ではsetIntervalが停止するが、再生中のaudio要素の
+  // timeupdateイベントは発火し続ける。これを「心拍」として利用し、
+  // Date.now()で実時間を確認してフェーズ切替・残時間更新を行う。
+  const bgHeartbeatR=useRef(null);
 
   // ── Audio: <audio>要素ベース実装 ──
   //
@@ -251,6 +258,7 @@ function App(){
   const XFADE_S=5;
 
   // playP: アンロック済み要素でクロスフェードループ再生
+  // iOSバックグラウンド対策: loop=trueで音切れ防止 + timeupdateで心拍駆動
   const playP=(p,vol=1)=>{
     const pl=preloadedR.current;
     const elA=p==="work"?pl?.wA:pl?.bA;
@@ -262,6 +270,10 @@ function App(){
     // iOSではバッファリングに数秒かかるため .then() が遅延発火する場合がある
     elA._claimed=true; elB._claimed=true;
 
+    // iOSバックグラウンドではcrossfade用setIntervalが停止するため
+    // loop=trueにして音声が途切れないようにする（フォアグラウンドではcrossfadeが優先）
+    elA.loop=true; elB.loop=true;
+
     elA.currentTime=0; elB.currentTime=0;
     elA.volume=Math.max(0,Math.min(1,vol)); elB.volume=0;
 
@@ -270,6 +282,21 @@ function App(){
     let crossfading=false;
     let stopped=false;
     let paused=false;
+
+    // ── iOSバックグラウンド心拍 ──
+    // timeupdateはiOSロック画面でもaudio再生中は発火し続けるため、
+    // これをタイマー心拍として使い、Date.now()でフェーズ切替を判定する。
+    // スロットル: 最大1秒に1回
+    let lastHB=0;
+    const onTimeUpdate=()=>{
+      if(stopped||paused)return;
+      const now=Date.now();
+      if(now-lastHB<900)return;
+      lastHB=now;
+      if(bgHeartbeatR.current)bgHeartbeatR.current();
+    };
+    elA.addEventListener('timeupdate',onTimeUpdate);
+    elB.addEventListener('timeupdate',onTimeUpdate);
 
     // アンロック済みなのでタイマー起動・フェーズ切替からでも再生可能
     active.play().catch(()=>{});
@@ -301,8 +328,10 @@ function App(){
     setCur(p,{
       stop:()=>{
         stopped=true; clearInterval(tid);
-        try{elA.pause();elA.currentTime=0;}catch(e){}
-        try{elB.pause();elB.currentTime=0;}catch(e){}
+        elA.removeEventListener('timeupdate',onTimeUpdate);
+        elB.removeEventListener('timeupdate',onTimeUpdate);
+        try{elA.pause();elA.currentTime=0;elA.loop=false;}catch(e){}
+        try{elB.pause();elB.currentTime=0;elB.loop=false;}catch(e){}
       },
       pause:()=>{
         paused=true;
@@ -327,6 +356,9 @@ function App(){
   };
 
   const advancePhase=()=>{
+    // 二重呼び出し防止（バックグラウンド心拍とsetIntervalの両方から呼ばれる可能性）
+    if(advancingR.current)return;
+    advancingR.current=true;
     hardStopAll();
     if(phR.current==="work"){
       const nt=bmR.current*60;
@@ -337,6 +369,7 @@ function App(){
     }else{
       if(csR.current>=tsR.current){
         setRun(false);runR.current=false;endAtR.current=null;
+        advancingR.current=false;
         setSc("complete");return;
       }
       const ns=csR.current+1;csR.current=ns;setCurSet(ns);
@@ -345,6 +378,20 @@ function App(){
       ttR.current=nt;setTLeft(nt);setTotTime(nt);
       endAtR.current=Date.now()+nt*1000;
       playP("work",1);
+    }
+    setTimeout(()=>{advancingR.current=false;},200);
+  };
+
+  // ── バックグラウンド心拍関数の設定 ──
+  // playP内のaudio timeupdateイベントから呼ばれる
+  bgHeartbeatR.current=()=>{
+    if(!runR.current||endAtR.current===null||advancingR.current)return;
+    const remaining=Math.round((endAtR.current-Date.now())/1000);
+    if(remaining<=0){
+      advancePhase();
+    }else{
+      setTLeft(remaining);
+      if(ttR.current>0)setVol(phR.current,calcVol(remaining,ttR.current));
     }
   };
 
@@ -402,33 +449,34 @@ function App(){
   };
   const doReset=()=>{
     setRun(false);runR.current=false;endAtR.current=null;
+    advancingR.current=false;
     hardStopAll();
     preloadedR.current=null;
     setSc("setup");setPhase("work");setCurSet(1);setTLeft(0);setTotTime(0);
   };
 
-  // ── カウントダウン ──
+  // ── カウントダウン（フォアグラウンド用） ──
+  // Date.now()ベースで正確な残時間を計算
   useEffect(()=>{
     if(run){
       iR.current=setInterval(()=>{
-        setTLeft(t=>{
-          const next=Math.max(0,t-1);
-          if(ttR.current>0)setVol(phR.current,calcVol(next,ttR.current));
-          if(next===0)setTimeout(advancePhase,50);
-          return next;
-        });
+        if(!runR.current||endAtR.current===null||advancingR.current)return;
+        const remaining=Math.max(0,Math.round((endAtR.current-Date.now())/1000));
+        setTLeft(remaining);
+        if(ttR.current>0)setVol(phR.current,calcVol(remaining,ttR.current));
+        if(remaining<=0)advancePhase();
       },1000);
     }else clearInterval(iR.current);
     return()=>clearInterval(iR.current);
   },[run]);
 
-  // ── バックグラウンド時刻補正 ──
+  // ── バックグラウンド復帰時の補正 ──
   useEffect(()=>{
     const onVis=()=>{
-      if(document.hidden||!runR.current||endAtR.current===null)return;
+      if(document.hidden||!runR.current||endAtR.current===null||advancingR.current)return;
       const remaining=Math.round((endAtR.current-Date.now())/1000);
       if(remaining<=0){
-        setTLeft(0);setTimeout(advancePhase,50);
+        setTLeft(0);advancePhase();
       }else{
         setTLeft(remaining);
         setVol(phR.current,calcVol(remaining,ttR.current));
@@ -498,12 +546,20 @@ function App(){
             <span> / {totalSets} セット</span>
           </div>
         </div>
-        <div style={{marginBottom:18,padding:"6px 20px",borderRadius:24,
-          border:`1px solid ${ac}55`,background:acG,color:ac,
-          fontSize:12,fontWeight:700,letterSpacing:2.5,
-          animation:!run?"blinkAnim 1.4s ease-in-out infinite":undefined}}>
-          {!run?"⏸ 一時停止":phase==="work"?"● 作業中":"◎ 休憩中"}
-        </div>
+        {!run?(
+          <div key="paused" style={{marginBottom:18,padding:"6px 20px",borderRadius:24,
+            border:`1px solid ${ac}55`,background:acG,color:ac,
+            fontSize:12,fontWeight:700,letterSpacing:2.5,
+            animation:"blinkAnim 1.4s ease-in-out infinite"}}>
+            ⏸ 一時停止
+          </div>
+        ):(
+          <div key={`running-${phase}`} style={{marginBottom:18,padding:"6px 20px",borderRadius:24,
+            border:`1px solid ${ac}55`,background:acG,color:ac,
+            fontSize:12,fontWeight:700,letterSpacing:2.5}}>
+            {phase==="work"?"● 作業中":"◎ 休憩中"}
+          </div>
+        )}
         <Ring progress={prog} phase={phase} tLeft={tLeft}/>
         <div style={{display:"flex",gap:7,marginTop:18,marginBottom:22}}>
           {Array.from({length:totalSets},(_,i)=>(
